@@ -1,0 +1,5 @@
+# Copy to .privacy_denylist (gitignored) and list private strings, one per line.
+# Matching is case-insensitive substring. Lines starting with # are ignored.
+# Typical entries: your full name, personal email, OS username, account numbers.
+Jane Example
+jane.example

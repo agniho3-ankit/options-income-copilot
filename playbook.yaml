@@ -1,0 +1,119 @@
+# Options-income playbook: procedural memory for the copilot.
+#
+# The agent reads this file and never edits it. Changing a threshold is the owner's
+# decision: edit, bump `version`, and commit. The loader (options_copilot/playbook.py)
+# rejects unknown keys, missing keys, wrong types and inconsistent values.
+#
+# Percentages are written as percent (5 = 5%). Probabilities and deltas are fractions.
+# "Skill #N" refers to the sections of the owner's original written playbook.
+# Educational project only. These are one person's rules, not financial advice.
+
+version: 1
+
+# Decision tree: a new position needs the ticker on Tier 1 or Tier 2.
+# Watch names are screened and briefed but cannot be entered until promoted.
+universe:
+  tier_1: [MRVL, ANET, APH]
+  tier_2: [MSFT, NVDA, META, BAC]
+  watch: [SCHW, AAPL]
+
+# Skill #1: weekly candidate screener.
+screener:
+  # Transparent 0-10 composite that replaces proprietary scores; 2.5 points per component.
+  quality_score_min: 7.0
+  quality_weights:
+    analyst: 2.5        # consensus and price target
+    fundamentals: 2.5   # EDGAR profitability and growth
+    trend: 2.5          # price vs 200-day moving average
+    insider: 2.5        # Form 4 buy/sell balance
+  analyst_buy_ratio_min: 0.80    # "Strong Buy": buy count / total
+  analyst_count_min: 10
+  analyst_upside_max_pct: 20     # call-selling comfort zone
+  market_cap_min_usd: 100000000000
+  price_min_usd: 20
+  sectors: [Technology, Financial Services]   # yfinance sector names
+  country: United States
+  exclusions:
+    pending_mna: true            # from the filings landmine check
+    fda_events: true
+    reverse_split_lookback_months: 12
+    insider_sell_buy_ratio_max: 2.0
+    insider_lookback_days: 90
+
+# Skill #2: pre-trade checklist. Hard checks BLOCK; advisory checks appear in the brief.
+entry:
+  dte_min: 30
+  dte_max: 60
+  dte_target: 45
+  cash_secured_put_price_max_usd: 300   # the $300 cap applies to cash-secured puts only
+  earnings:
+    block_within_days: 7                # always BLOCK
+    spreads_only_within_days: 30        # 8-30 days: defined-risk spreads only
+    expiry_must_precede: true           # BLOCK if expiry is on/after the earnings date
+  pop_min: 0.65
+  pop_method: breakeven_lognormal       # P(finish between breakevens), Black-Scholes with chain IV
+  open_interest_min: 500                # at each short strike
+  position_risk_pct:
+    warn: 2
+    block: 5
+  portfolio_heat_pct:                   # sum of max losses after this trade
+    warn: 20
+    block: 30
+  support_resistance:
+    placement: beyond_levels            # short put <= support, short call >= resistance
+    lookback_trading_days: 120
+    pivot_window_bars: 5
+  advisory:
+    dividend_exdate_within_days: 30
+    rsi_oversold: 30                    # puts risky below
+    rsi_overbought: 70                  # calls risky above
+    iv_rank_low: 30
+    iv_rank_target: 50
+    iv_rank_high: 70
+    unusual_flow_vol_oi_ratio: 2.0
+
+# Skill #3: iron condor builder (also used for single spreads).
+builder:
+  short_delta_min: 0.20
+  short_delta_max: 0.30
+  strike_selection: delta               # delta picks the strike; % rules are bounds
+  wing_width_pct: 3.0                   # of the underlying, snapped to a listed strike
+  short_call_max: analyst_target
+  credit_price: mid
+
+# Skill #4: trade management. The engine returns every triggered rule;
+# the agent resolves conflicts only among rule-compliant actions.
+management:
+  r1_profit_target_pct: 50              # close at >= 50% of max profit
+  r2_roll:
+    dte_below: 21
+    roll_to_dte: 45
+  r3_stop_loss:
+    loss_credit_multiple: 1.0           # close when unrealized loss >= 1x credit received
+    reentry_cooldown_days: 3
+  r4_big_move:
+    sigma: 1.0
+    close_all_below_200dma: true
+  r5_earnings:
+    close_all_within_days: 7
+    close_calls_within_days: 30
+  r6_iv_crush:
+    iv_rank_drop_points: 20
+    window_trading_days: 5
+    roll_out_days: 7
+  r7_ex_dividend:
+    within_days: 7
+    leg: short_call_itm                 # early-assignment risk sits on ITM short calls
+    extrinsic_below_dividend: true      # classic early-exercise condition
+  r8_heat:
+    max_pct: 30
+    review_weekday: friday
+  emergency:
+    sector_drop_pct: 5
+    insider_stake_sale_pct: 50
+
+# IV Rank needs a year of daily snapshots; use proxies until then (labelled in every brief).
+iv_rank:
+  full_history_days: 252
+  percentile_min_snapshots: 20          # IV percentile over available days
+  realized_vol_window_days: 30          # before that: ATM IV / realized vol

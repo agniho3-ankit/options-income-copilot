@@ -1,0 +1,47 @@
+# --- Secrets and private config (never commit) ---
+.env
+.env.*
+!.env.example
+.privacy_denylist
+*.pem
+*.key
+
+# --- Local data: filings, chains, Chroma index, SQLite journal, traces ---
+data/
+demo_outputs/
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+*.pkl
+*.onnx
+
+# --- Course material and private documents (belong in the parent folder) ---
+*.docx
+*.pdf
+OPTIONS_SELLER_SKILL.md
+DEV_KICKOFF_PROMPT.md
+Checkpoint_*.md
+Capstone_Proposal*.md
+Discussion_*.md
+.claude/
+
+# --- Python / tooling ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
+*.swp

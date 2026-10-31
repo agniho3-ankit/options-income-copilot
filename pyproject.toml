@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "options-income-copilot"
+version = "0.0.1"
+description = "Educational agentic-AI capstone: a human-approved, rules-based options-income copilot (no live trading)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
+    "chromadb>=0.5",
+    "yfinance>=0.2.40",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pre-commit>=3.7"]
+
+[project.scripts]
+copilot = "options_copilot.cli:main"
+
+[tool.setuptools]
+packages = ["options_copilot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not llm and not network'"
+markers = [
+    "llm: needs a running Ollama model (skipped by default; run with -m llm)",
+    "network: needs internet access (skipped by default; run with -m network)",
+]
