@@ -21,6 +21,7 @@ class LLMResponse:
     content: str
     model: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    eval_tokens: int = 0
 
 
 class LLMClient(Protocol):
@@ -64,8 +65,10 @@ class OllamaClient:
             raise LLMError(f"Ollama unreachable: {type(exc).__name__}") from None
         if resp.status_code != 200:
             raise LLMError(f"Ollama returned HTTP {resp.status_code}")
-        msg = resp.json().get("message", {})
-        return LLMResponse(msg.get("content", ""), self.name, msg.get("tool_calls") or [])
+        body = resp.json()
+        msg = body.get("message", {})
+        return LLMResponse(msg.get("content", ""), self.name, msg.get("tool_calls") or [],
+                           int(body.get("eval_count") or 0))
 
 
 class AnthropicClient:
@@ -130,9 +133,9 @@ class FallbackClient:
                 raise LLMError(f"{first}; fallback failed too: {second}") from None
 
 
-def build_llm(settings) -> FallbackClient:
+def build_llm(settings, num_ctx: int = 8192) -> FallbackClient:
     primary = OllamaClient(settings.ollama_url, settings.ollama_model, think=settings.ollama_think,
-                           temperature=settings.llm_temperature)
+                           temperature=settings.llm_temperature, num_ctx=num_ctx)
     fallback = (AnthropicClient(settings.anthropic_api_key, settings.anthropic_model)
                 if settings.has_anthropic_fallback else None)
     return FallbackClient(primary, fallback)

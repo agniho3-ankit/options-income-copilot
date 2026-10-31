@@ -372,6 +372,142 @@ def cmd_screen(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Phase 3: ReAct agent, briefs, Reflexion -----------------------------------------------
+
+def _db(settings):
+    from .db import Database
+    return Database(settings.db_path)
+
+
+def _render_brief(b: dict) -> str:
+    p = b["payload"]
+    prop, n = p["proposal"], p["numbers"]
+    lines = [f"== Brief {b['brief_id']} [{b['status'].upper()}] {b['kind']} {b['ticker']} ==",
+             f"as of {p['as_of']} | verifier {b['verdict']} | playbook {p['playbook_sha256'][:12]} | run {p['run_id']}",
+             f"trade: {prop['strategy']} exp {prop['legs'][0]['expiry']}, {prop['contracts']} contract(s)"]
+    for g in prop["legs"]:
+        lines.append(f"  {g['side']:<5} {g['option_type']:<4} {g['strike']:>8g}  mid {(g['bid'] + g['ask']) / 2:.2f}  delta {g['delta']}")
+    lines.append(f"numbers (calculators): credit ${n['credit']:.2f}, max loss ${n['max_loss']:.2f}, breakevens "
+                 f"{n['breakevens']}, PoP {n['pop']:.1%}, risk {n['risk_pct_of_portfolio']:.2f}% (synthetic portfolio)")
+    lines.append("rules checked:")
+    for c in p["verifier"]:
+        lines.append(f"  {c['verdict']:<22}{c['name']:<22}{c['reason']}")
+    lines.append(f"filings: {p.get('landmine_verdict')}")
+    for c in p.get("citations", []):
+        lines.append(f"  cite: {c['form']} {c['date']} {c['item']}  {c['url']}")
+    for lesson in p.get("lessons", []):
+        lines.append(f"  lesson: {lesson[:120]}")
+    for r in p.get("risks", []):
+        lines.append(f"  risk: {r}")
+    lines.append(f"agent summary: {p.get('summary') or '(none)'}")
+    if b.get("decided_at"):
+        lines.append(f"decision: {b['status']} at {b['decided_at']}: {b.get('decision_reason')}")
+    return "\n".join(lines)
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    from .agent_tools import ToolBox
+    from .briefs import make_brief, reflect_on_failures
+    from .llm import build_llm
+    from .market import Market
+    from .mask import Masker
+    from .react import run_agent
+    from .tools import LiveSources
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    store, llm = _store(settings), build_llm(settings, num_ctx=16384)
+    db = _db(settings)
+    masker = Masker(settings.synthetic_portfolio_value)
+    box = ToolBox(args.ticker, LiveSources(pb, as_of, Market(), _edgar_or_none(settings), store, build_llm(settings)),
+                  pb, as_of, settings.synthetic_portfolio_value)
+    task = f"Plan one entry trade on {box.ticker} as of {as_of.isoformat()}."
+    result = run_agent(task, box, llm, db, masker, pb, max_steps=args.max_steps)
+    lines = [f"run {result.run_id}: {result.outcome} after {result.stats['steps']} step(s), "
+             f"{result.stats['tool_calls']} tool call(s) ({result.stats['bad_calls']} malformed), "
+             f"{result.stats['eval_tokens']} tokens"]
+    for row in db.trace(result.run_id):
+        if row["role"] == "tool":
+            t = json.loads(row["content"])
+            obs = t["observation"]
+            short = obs.get("error") or obs.get("verdict") or obs.get("proposal_id") or "ok"
+            lines.append(f"  -> {row['name']}({json.dumps(t['arguments'])})  <- {short}")
+    brief_id = make_brief(result, box, db, as_of)
+    lesson = reflect_on_failures(box, build_llm(settings), store, masker)
+    if lesson is not None:
+        lines.append(f"Reflexion (verifier): {lesson.lesson}")
+    if brief_id:
+        lines.append("")
+        lines.append(_render_brief(db.brief(brief_id)))
+        lines.append(f"\nApprove with: copilot approve {brief_id}   or reject with: copilot reject {brief_id} --reason \"...\"")
+    else:
+        lines.append(f"No brief: {result.final_text.strip() or result.outcome}")
+    text = "\n".join(lines)
+    print(text)
+    if args.save:
+        _save(settings, f"brief_{box.ticker}_{as_of}", {"run": db.run(result.run_id), "trace": db.trace(result.run_id),
+              "brief": db.brief(brief_id) if brief_id else None}, text)
+    return 0 if brief_id else 1
+
+
+def cmd_briefs(args: argparse.Namespace) -> int:
+    for b in _db(load_settings()).briefs(args.status):
+        print(f"{b['brief_id']}  {b['status']:<9} {b['kind']:<6} {b['ticker']:<5} {b['verdict'] or '-':<22} {b['created_at']}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    b = _db(load_settings()).brief(args.brief_id)
+    if b is None:
+        print(f"no brief {args.brief_id}", file=sys.stderr)
+        return 1
+    print(_render_brief(b))
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    from .briefs import approve
+    db = _db(load_settings())
+    try:
+        ticket_id = approve(db, args.brief_id, args.note)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    t = next(t for t in db.tickets() if t["ticket_id"] == ticket_id)
+    print(f"approved {args.brief_id}; wrote order ticket {ticket_id} (paper only, nothing was sent anywhere)")
+    print(json.dumps(t["payload"], indent=2))
+    return 0
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    from .briefs import reject
+    from .llm import build_llm
+    from .mask import Masker
+    settings = load_settings()
+    try:
+        lesson = reject(_db(settings), args.brief_id, args.reason, llm=build_llm(settings), store=_store(settings),
+                        masker=Masker(settings.synthetic_portfolio_value))
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(f"rejected {args.brief_id}. Reflexion lesson stored: {lesson.lesson}")
+    return 0
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    db = _db(load_settings())
+    run = db.run(args.run_id)
+    if run is None:
+        print(f"no run {args.run_id}", file=sys.stderr)
+        return 1
+    print(json.dumps(run, indent=2))
+    for row in db.trace(args.run_id):
+        body = row["content"] if len(row["content"]) < 600 or args.full else row["content"][:600] + " ..."
+        print(f"[{row['seq']:>3}] {row['role']:<9}{row['name'] or '':<18}{body}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="copilot", description="Options Income Copilot (educational; no live trading)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -431,6 +567,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--as-of")
     p.add_argument("--save", action="store_true")
     p.set_defaults(func=cmd_screen)
+
+    p = sub.add_parser("brief", help="run the ReAct agent to plan one entry and write a brief")
+    p.add_argument("ticker")
+    p.add_argument("--max-steps", type=int, default=14)
+    p.add_argument("--as-of")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_brief)
+
+    p = sub.add_parser("briefs", help="list briefs")
+    p.add_argument("--status", choices=["pending", "approved", "rejected"])
+    p.set_defaults(func=cmd_briefs)
+
+    p = sub.add_parser("show", help="show one brief")
+    p.add_argument("brief_id")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("approve", help="approve a pending brief (writes a paper order ticket)")
+    p.add_argument("brief_id")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_approve)
+
+    p = sub.add_parser("reject", help="reject a pending brief; the reason becomes a lesson")
+    p.add_argument("brief_id")
+    p.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_reject)
+
+    p = sub.add_parser("trace", help="print the masked trace of an agent run")
+    p.add_argument("run_id")
+    p.add_argument("--full", action="store_true")
+    p.set_defaults(func=cmd_trace)
     return parser
 
 

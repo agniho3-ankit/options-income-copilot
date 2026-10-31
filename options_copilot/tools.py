@@ -12,7 +12,7 @@ from typing import Any
 from .calculators import BuildError, BuildRules, CalcError, Extras, build_for_pop
 from .edgar import SEC_DATA, EdgarClient, EdgarError
 from .form4 import insider_activity
-from .indicators import rsi, sma, support_resistance
+from .indicators import realized_vol, rsi, sma, support_resistance
 from .market import Market, pick_expiry
 from .models import Strategy, TradeNumbers, TradeProposal, Verdict, VerifierResult
 from .playbook import Playbook
@@ -32,6 +32,7 @@ class TickerData:
     resistance: float | None
     insider: InsiderActivity | None
     notes: list[str] = field(default_factory=list)
+    rv30: float | None = None  # realized vol, for the IV-rank proxy
 
 
 def gather(ticker: str, as_of: date, pb: Playbook, market: Market, edgar: EdgarClient | None) -> TickerData:
@@ -51,7 +52,8 @@ def gather(ticker: str, as_of: date, pb: Playbook, market: Market, edgar: EdgarC
         except EdgarError as exc:
             notes.append(f"Form 4: {exc}")
     return TickerData(ticker.upper(), as_of, prof, sma(hist.closes, 50), sma(hist.closes, 200),
-                      rsi(hist.closes), lv.support, lv.resistance, insider, notes)
+                      rsi(hist.closes), lv.support, lv.resistance, insider, notes,
+                      realized_vol(hist.closes, pb["iv_rank.realized_vol_window_days"]))
 
 
 @dataclass
@@ -119,3 +121,26 @@ def screen_ticker(ticker: str, as_of: date, pb: Playbook, market: Market, edgar:
                           analyst_target=p.analyst_target, sma200=data.sma200, net_income_positive=income_ok,
                           revenue_growth=growth, insider=data.insider, reverse_split_recent=reverse)
     return screen(inputs, pb), data
+
+
+class LiveSources:
+    """Public data for the agent's tools: yfinance, SEC EDGAR, and the local Chroma index."""
+
+    def __init__(self, pb: Playbook, as_of: date, market: Market, edgar: EdgarClient | None, store, llm):
+        self.pb, self.as_of, self.market, self.edgar, self.store, self.llm = pb, as_of, market, edgar, store, llm
+
+    def ticker_data(self, ticker: str) -> TickerData:
+        return gather(ticker, self.as_of, self.pb, self.market, self.edgar)
+
+    def expiries(self, ticker: str) -> list[date]:
+        return self.market.expiries(ticker)
+
+    def chain(self, ticker: str, expiry: date):
+        return self.market.chain(ticker, expiry)
+
+    def landmine(self, ticker: str, context: str) -> dict:
+        from .agent import landmine_check
+        return landmine_check(ticker, context, store=self.store, llm=self.llm, as_of=self.as_of)
+
+    def lessons(self, ticker: str, query: str):
+        return self.store.search_lessons(ticker, query)

@@ -67,6 +67,23 @@ strikes by delta (0.20-0.30), and widens them inside the band until PoP passes. 
 Advisory checks add CAUTION only. Any missing fact gives `INSUFFICIENT_EVIDENCE`, which fails the
 gate. `--masked` prints the view the LLM gets: account values as % of portfolio and IDs as tokens.
 
+# ReAct agent, approval briefs, Reflexion (Phase 3)
+python -m options_copilot.cli brief MSFT                 # agent plans one entry with tools; writes a pending brief
+python -m options_copilot.cli briefs --status pending
+python -m options_copilot.cli show BRIEF_ID
+python -m options_copilot.cli approve BRIEF_ID           # writes a paper order ticket; nothing is sent anywhere
+python -m options_copilot.cli reject BRIEF_ID --reason "too close to resistance"   # reason becomes a lesson
+python -m options_copilot.cli trace RUN_ID               # the masked step-by-step trace
+```
+
+The agent (Qwen through Ollama tool calling) has ten tools: market data, the filings check,
+lessons, `build_trade`, `price_trade`, `submit_trade`, and `flag_concern`. It has no approve tool.
+Observations are masked before the model sees them, and every step is logged to
+`data/copilot.db`. When the verifier rejects a trade, the reasons come back to the agent so it can
+revise. If a failure applies to the whole ticker (earnings within 7 days, a filings BLOCK, tier, or
+insider BLOCK), the agent is told to stop. Verifier failures, rejections, and (later) closed trades
+each produce a short Reflexion lesson in the `reflections` collection.
+
 ```bash
 The first `ingest` or `seed-lessons` run downloads Chroma's built-in MiniLM embedding model
 (about 80 MB, cached under your home directory). `check` and `compare` need Ollama running.
@@ -111,8 +128,8 @@ Unit tests block network access, and use fake LLM and data clients.
 | 0 | Repo guardrails, playbook config and loader, models | done |
 | 1 | RAG landmine check (EDGAR ingest, chunking, MMR, coverage check) | done |
 | 2 | Calculators, verifier, management rules, mask, screener | done |
-| 3 | ReAct agent, approval briefs, Reflexion | next |
-| 4 | Journal, monitor, end-to-end demo | planned |
+| 3 | ReAct agent, approval briefs, Reflexion | done |
+| 4 | Journal, monitor, end-to-end demo | next |
 
 ## License
 
