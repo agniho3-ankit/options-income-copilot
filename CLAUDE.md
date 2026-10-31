@@ -51,7 +51,9 @@ python -m options_copilot.cli playbook     # validate playbook.yaml
 
 ## Layout
 
-- `options_copilot/`: package (`config.py`, `playbook.py`, `models.py`, `cli.py`, with more per phase)
+- `options_copilot/`: package. Phase 0: `config.py`, `playbook.py`, `models.py`, `cli.py`. Phase 1:
+  `edgar.py`, `news.py`, `chunker.py`, `store.py` (Chroma, MMR, coverage), `llm.py`, `agent.py`
+  (`landmine_check`), `ingest.py`, `seed_lessons.yaml` (synthetic)
 - `playbook.yaml`: the rules (procedural memory), validated strictly by `playbook.py`
 - `scripts/privacy_audit.py`: stdlib pre-commit privacy scan
 - `tests/`: pytest, network blocked by `conftest.py`

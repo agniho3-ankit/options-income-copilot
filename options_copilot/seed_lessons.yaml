@@ -1,0 +1,43 @@
+# SYNTHETIC lessons used to seed the `reflections` collection. They are written for this
+# project and describe no real trade or account. Real lessons are added later by Reflexion.
+lessons:
+  - ticker: ANY
+    trigger: rejection
+    tags: [filings, officer_change]
+    lesson: >-
+      Synthetic lesson: an 8-K Item 5.02 announcing a sudden CFO departure inside the trade
+      window was treated as routine and the brief was rejected. Treat unplanned CEO or CFO
+      exits as CAUTION and say so in the brief.
+  - ticker: ANY
+    trigger: verifier
+    tags: [filings, mna]
+    lesson: >-
+      Synthetic lesson: a proposal reached the verifier while an Item 1.01 merger agreement was
+      pending. A pending deal pins or gaps the stock, so a pending acquisition of the company is a
+      BLOCK, not a CAUTION.
+  - ticker: ANY
+    trigger: trade_close
+    tags: [evidence]
+    lesson: >-
+      Synthetic lesson: a landmine check returned CLEAR from model memory with no filings in the
+      window, and the stock gapped on old news the model did not know. No cited filing means
+      INSUFFICIENT_EVIDENCE.
+  - ticker: ANY
+    trigger: rejection
+    tags: [headlines]
+    lesson: >-
+      Synthetic lesson: a scary headline about a rumored probe had no matching filing. Headlines
+      alone justify CAUTION and a smaller size, not a BLOCK.
+  - ticker: ANY
+    trigger: trade_close
+    tags: [earnings, results]
+    lesson: >-
+      Synthetic lesson: an Item 2.02 results release with a guidance cut moved the stock more than
+      one standard deviation the following week. A guidance cut in a 2.02 exhibit is CAUTION even
+      when the headline numbers beat.
+  - ticker: ANY
+    trigger: verifier
+    tags: [debt]
+    lesson: >-
+      Synthetic lesson: a large new debt offering (Item 2.03) was ignored because the stock was
+      strong. Large new obligations are material: note them as CAUTION.

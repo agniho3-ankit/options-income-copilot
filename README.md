@@ -43,9 +43,33 @@ pre-commit install
 ```bash
 python -m options_copilot.cli playbook   # validate playbook.yaml and print its key rules
 python -m options_copilot.cli config     # show settings (secrets are never printed)
+
+# RAG landmine check (Phase 1)
+python -m options_copilot.cli seed-lessons                 # load the synthetic seed lessons
+python -m options_copilot.cli ingest --universe            # 90 days of 8-K/10-Q/10-K + headlines
+python -m options_copilot.cli filings MRVL                 # what is indexed for a ticker
+python -m options_copilot.cli check MRVL                   # verdict with citations
+python -m options_copilot.cli check MRVL --no-rag          # baseline from model memory only
+python -m options_copilot.cli compare MRVL --save          # both, side by side, saved to demo_outputs/
+python -m options_copilot.cli reflect "lesson text" --ticker MRVL --trigger rejection
 ```
 
-More commands arrive with each build phase (see Status).
+The first `ingest` or `seed-lessons` run downloads Chroma's built-in MiniLM embedding model
+(about 80 MB, cached under your home directory). `check` and `compare` need Ollama running.
+
+### How the landmine check decides
+
+1. Retrieval is hard-filtered to the ticker and the 90 days up to `--as-of`, fetches 20
+   candidates, and uses MMR to pick 5 diverse chunks.
+2. **Coverage check.** If no chunk passes the similarity threshold, no filing (only headlines)
+   matches, or fewer than 2 chunks pass, the verdict is `INSUFFICIENT_EVIDENCE` and the LLM is
+   not asked.
+3. Qwen reads the chunks, which are wrapped in `<<<DOC ...>>>` delimiters as untrusted data, and
+   proposes a verdict with cited chunk IDs. It is offered no tools.
+4. Python enforces the rules. `CLEAR` needs a cited filing. A `BLOCK` that rests only on
+   headlines becomes `CAUTION`. An uncited `BLOCK` and any unparseable reply escalate.
+   Invented citations are dropped. Citations always come from the stored metadata, never
+   from model text.
 
 ## Tests
 
@@ -71,8 +95,8 @@ Unit tests block network access, and use fake LLM and data clients.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo guardrails, playbook config and loader, models | done |
-| 1 | RAG landmine check (EDGAR ingest, chunking, MMR, coverage check) | next |
-| 2 | Calculators, verifier, management rules, mask | planned |
+| 1 | RAG landmine check (EDGAR ingest, chunking, MMR, coverage check) | done |
+| 2 | Calculators, verifier, management rules, mask | next |
 | 3 | ReAct agent, approval briefs, Reflexion | planned |
 | 4 | Journal, monitor, end-to-end demo | planned |
 

@@ -14,7 +14,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "requests>=2.32",
     "beautifulsoup4>=4.12",
-    "chromadb>=0.5",
+    "chromadb>=1.0",
     "yfinance>=0.2.40",
 ]
 
@@ -26,6 +26,9 @@ copilot = "options_copilot.cli:main"
 
 [tool.setuptools]
 packages = ["options_copilot"]
+
+[tool.setuptools.package-data]
+options_copilot = ["*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -81,3 +81,24 @@ def load_settings(env: dict[str, str] | None = None, root: Path = REPO_ROOT) -> 
         sec_user_agent=get("SEC_USER_AGENT"),
         anthropic_api_key=get("ANTHROPIC_API_KEY"),
     )
+
+
+@dataclass(frozen=True)
+class RetrievalConfig:
+    """RAG tuning knobs. These are engineering settings, not playbook thresholds.
+
+    Token counts are approximate: the chunker counts words and assumes ~0.75 words per
+    token, which is close enough for English filings.
+    """
+    window_days: int = 90
+    fetch_k: int = 20
+    k: int = 5
+    lesson_fetch_k: int = 10
+    lesson_k: int = 3
+    mmr_lambda: float = 0.5        # 1.0 = pure relevance, 0.0 = pure diversity
+    min_similarity: float = 0.30   # cosine similarity a chunk needs (MiniLM: relevant ~0.37+, off-topic <=0.22)
+    min_chunks: int = 2            # passing chunks needed, at least one from a filing
+    chunk_tokens: int = 400
+    overlap_tokens: int = 50
+    words_per_token: float = 0.75
+    min_section_words: int = 40    # shorter sections (tables of contents, stubs) are dropped
