@@ -94,6 +94,7 @@ def test_bad_leaf_values_are_rejected(raw, path, value, fragment):
     (lambda r: r["entry"]["position_risk_pct"].update(warn=5), "position_risk_pct.warn"),
     (lambda r: r["entry"]["portfolio_heat_pct"].update(warn=31), "portfolio_heat_pct.warn"),
     (lambda r: r["builder"].update(short_delta_min=0.30), "short_delta_min"),
+    (lambda r: r["builder"].update(condor_short_delta_min=0.25), "condor_short_delta_min"),
     (lambda r: r["entry"].update(dte_target=61), "dte_target"),
     (lambda r: r["management"]["r2_roll"].update(dte_below=30), "r2_roll.dte_below"),
     (lambda r: r["entry"]["earnings"].update(block_within_days=30), "block_within_days"),

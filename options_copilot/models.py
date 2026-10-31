@@ -245,7 +245,13 @@ class Position:
     entry_max_loss: float
     contracts: int = 1
     status: PositionStatus = PositionStatus.OPEN
+    entry_spot: float | None = None   # underlying price at entry (Rule 4)
+    entry_iv: float | None = None     # IV used at entry (Rule 4 sigma)
     synthetic: bool = True
+
+    @property
+    def expiry(self) -> date:
+        return self.legs[0].expiry
 
 
 @dataclass

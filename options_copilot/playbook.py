@@ -85,6 +85,8 @@ SPEC: dict[str, Rule] = {
     "entry.advisory.unusual_flow_vol_oi_ratio": Rule(NUM, 0),
     "builder.short_delta_min": Rule(NUM, 0, 1),
     "builder.short_delta_max": Rule(NUM, 0, 1),
+    "builder.condor_short_delta_min": Rule(NUM, 0, 1),
+    "builder.condor_short_delta_max": Rule(NUM, 0, 1),
     "builder.strike_selection": Rule(str, choices=("delta",)),
     "builder.wing_width_pct": Rule(NUM, 0.1, 50),
     "builder.short_call_max": Rule(str, choices=("analyst_target",)),
@@ -96,6 +98,7 @@ SPEC: dict[str, Rule] = {
     "management.r3_stop_loss.reentry_cooldown_days": _days(),
     "management.r4_big_move.sigma": Rule(NUM, 0.1, 10),
     "management.r4_big_move.close_all_below_200dma": Rule(bool),
+    "management.r4_big_move.sigma_basis": Rule(str, choices=("days_held",)),
     "management.r5_earnings.close_all_within_days": _days(),
     "management.r5_earnings.close_calls_within_days": _days(),
     "management.r6_iv_crush.iv_rank_drop_points": _pct(),
@@ -160,6 +163,7 @@ def _check_consistency(v: dict[str, Any]) -> list[str]:
     less("entry.dte_target", "entry.dte_max", strict=False)
     less("management.r2_roll.dte_below", "entry.dte_min")
     less("builder.short_delta_min", "builder.short_delta_max")
+    less("builder.condor_short_delta_min", "builder.condor_short_delta_max")
     less("entry.earnings.block_within_days", "entry.earnings.spreads_only_within_days")
     less("management.r5_earnings.close_all_within_days", "management.r5_earnings.close_calls_within_days")
     less("entry.advisory.rsi_oversold", "entry.advisory.rsi_overbought")

@@ -54,6 +54,20 @@ python -m options_copilot.cli compare MRVL --save          # both, side by side,
 python -m options_copilot.cli reflect "lesson text" --ticker MRVL --trigger rejection
 ```
 
+# Calculators, verifier, management, screener (Phase 2)
+python -m options_copilot.cli build MSFT                          # iron condor from the live chain, verified
+python -m options_copilot.cli build MSFT --strategy put_credit_spread --masked
+python -m options_copilot.cli manage-demo                         # the 8 rules on synthetic positions
+python -m options_copilot.cli screen                              # 0-10 quality composite for the universe
+```
+
+`build` picks the expiry nearest 45 DTE inside 30-60 (preferring one before earnings), picks short
+strikes by delta (0.20-0.30), and widens them inside the band until PoP passes. It sets wings at
+3% of price and then runs every verifier check against the synthetic portfolio. Hard checks BLOCK.
+Advisory checks add CAUTION only. Any missing fact gives `INSUFFICIENT_EVIDENCE`, which fails the
+gate. `--masked` prints the view the LLM gets: account values as % of portfolio and IDs as tokens.
+
+```bash
 The first `ingest` or `seed-lessons` run downloads Chroma's built-in MiniLM embedding model
 (about 80 MB, cached under your home directory). `check` and `compare` need Ollama running.
 
@@ -96,8 +110,8 @@ Unit tests block network access, and use fake LLM and data clients.
 |---|---|---|
 | 0 | Repo guardrails, playbook config and loader, models | done |
 | 1 | RAG landmine check (EDGAR ingest, chunking, MMR, coverage check) | done |
-| 2 | Calculators, verifier, management rules, mask | next |
-| 3 | ReAct agent, approval briefs, Reflexion | planned |
+| 2 | Calculators, verifier, management rules, mask, screener | done |
+| 3 | ReAct agent, approval briefs, Reflexion | next |
 | 4 | Journal, monitor, end-to-end demo | planned |
 
 ## License

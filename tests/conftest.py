@@ -76,3 +76,10 @@ def store(tmp_path):
     from options_copilot.store import Store
 
     return Store(tmp_path / "chroma", embedding_function=BagOfWordsEmbedding())
+
+
+@pytest.fixture(scope="session")
+def pb():
+    from options_copilot.playbook import load_playbook
+
+    return load_playbook(REPO_ROOT / "playbook.yaml")

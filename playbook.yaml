@@ -8,7 +8,7 @@
 # "Skill #N" refers to the sections of the owner's original written playbook.
 # Educational project only. These are one person's rules, not financial advice.
 
-version: 1
+version: 3
 
 # Decision tree: a new position needs the ticker on Tier 1 or Tier 2.
 # Watch names are screened and briefed but cannot be entered until promoted.
@@ -31,7 +31,7 @@ screener:
   analyst_upside_max_pct: 20     # call-selling comfort zone
   market_cap_min_usd: 100000000000
   price_min_usd: 20
-  sectors: [Technology, Financial Services]   # yfinance sector names
+  sectors: [Technology, Financial Services, Communication Services]   # yfinance sector names (META)
   country: United States
   exclusions:
     pending_mna: true            # from the filings landmine check
@@ -74,8 +74,10 @@ entry:
 
 # Skill #3: iron condor builder (also used for single spreads).
 builder:
-  short_delta_min: 0.20
+  short_delta_min: 0.20                 # spreads and cash-secured puts
   short_delta_max: 0.30
+  condor_short_delta_min: 0.12          # iron condors sell two sides, so each short sits further out
+  condor_short_delta_max: 0.20          #   (0.20-0.30 condors only reach ~57-61% breakeven PoP)
   strike_selection: delta               # delta picks the strike; % rules are bounds
   wing_width_pct: 3.0                   # of the underlying, snapped to a listed strike
   short_call_max: analyst_target
@@ -93,6 +95,7 @@ management:
     reentry_cooldown_days: 3
   r4_big_move:
     sigma: 1.0
+    sigma_basis: days_held              # 1 sigma = entry price x entry IV x sqrt(days held / 365)
     close_all_below_200dma: true
   r5_earnings:
     close_all_within_days: 7

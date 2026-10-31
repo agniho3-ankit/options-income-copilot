@@ -54,6 +54,9 @@ python -m options_copilot.cli playbook     # validate playbook.yaml
 - `options_copilot/`: package. Phase 0: `config.py`, `playbook.py`, `models.py`, `cli.py`. Phase 1:
   `edgar.py`, `news.py`, `chunker.py`, `store.py` (Chroma, MMR, coverage), `llm.py`, `agent.py`
   (`landmine_check`), `ingest.py`, `seed_lessons.yaml` (synthetic)
+  Phase 2: `calculators.py` (Black-Scholes, numbers, strike builder), `verifier.py` (the gate),
+  `management.py` (8 rules), `mask.py`, `indicators.py`, `form4.py`, `screener.py`, `market.py`
+  (yfinance adapter), `tools.py` (gather -> build -> verify)
 - `playbook.yaml`: the rules (procedural memory), validated strictly by `playbook.py`
 - `scripts/privacy_audit.py`: stdlib pre-commit privacy scan
 - `tests/`: pytest, network blocked by `conftest.py`
