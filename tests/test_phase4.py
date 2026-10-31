@@ -334,6 +334,7 @@ def test_demo_runs_end_to_end_with_owner_approval(pb):
     assert any("Reflexion" in n for n in names) and names[-1] == "journal and metrics"
     assert res.steps[-1]["metrics"]["closed_trades"] == 1 and store.added
     assert "SIMULATED" in res.text
+    assert "copilot approve" not in res.text   # demo briefs live in its in-memory database
 
 
 def test_demo_stops_without_owner_approval(pb):

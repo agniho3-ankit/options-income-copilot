@@ -238,7 +238,8 @@ def _write_brief(db, pos, ev, decision, close_cost, info, as_of, pb, sources, ma
     return brief_id
 
 
-def render(items: list[MonitorItem], summary: dict, masker: Masker | None = None) -> str:
+def render(items: list[MonitorItem], summary: dict, masker: Masker | None = None, *, approve_hint: bool = True) -> str:
+    """`approve_hint=False` when the briefs live in a database the CLI cannot see (the demo)."""
     head = f"== Monitor as of {summary['as_of']}" + (f"  [{summary['simulated']}]" if summary.get("simulated") else "") + " =="
     lines = [head]
     for s in summary["settled_at_expiry"]:
@@ -257,7 +258,8 @@ def render(items: list[MonitorItem], summary: dict, masker: Masker | None = None
         for n in d.notes:
             lines.append(f"  note: {n}")
         if it.brief_id:
-            lines.append(f"  brief {it.brief_id} written; approve with: copilot approve {it.brief_id}")
+            lines.append(f"  brief {it.brief_id} written" + (f"; approve with: copilot approve {it.brief_id}"
+                                                                if approve_hint else ""))
         if it.note:
             lines.append(f"  {it.note}")
     lines.append(f"\nportfolio heat {summary['heat_pct']:.2f}% (synthetic portfolio)" +

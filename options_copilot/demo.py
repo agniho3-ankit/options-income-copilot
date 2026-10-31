@@ -99,7 +99,7 @@ def run_demo(ticker: str, *, sources: Any, pb, as_of: date, llm, masker, store, 
             exit_brief = mine[0].brief_id
             step(f"monitor (simulated day +{day})",
                  (f"days +1..+{day - 1}: no rule fired ({', '.join(quiet)})\n" if quiet else "")
-                 + render_monitor(items, summary), run_id=run_id, day=day)
+                 + render_monitor(items, summary, approve_hint=False), run_id=run_id, day=day)
             break
         quiet.append(f"+{day}: {mine[0].evaluation.profit_pct}%" if mine else f"+{day}: -")
     if exit_brief is None:
