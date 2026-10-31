@@ -8,7 +8,7 @@
 # "Skill #N" refers to the sections of the owner's original written playbook.
 # Educational project only. These are one person's rules, not financial advice.
 
-version: 3
+version: 4
 
 # Decision tree: a new position needs the ticker on Tier 1 or Tier 2.
 # Watch names are screened and briefed but cannot be entered until promoted.
@@ -120,3 +120,24 @@ iv_rank:
   full_history_days: 252
   percentile_min_snapshots: 20          # IV percentile over available days
   realized_vol_window_days: 30          # before that: ATM IV / realized vol
+
+# Module 4: Tree-of-Thought trade explorer (tot.py). Search settings and the deterministic
+# leaf score. Every leaf has already passed the verifier; the score only ranks survivors.
+tot:
+  beam_width: 3                         # nodes kept at each depth
+  max_depth: 3                          # 1 strategy, 2 expiry, 3 short-delta target
+  children_per_node: 3                  # candidates asked of the generator per node
+  max_builds: 24                        # build_and_verify calls per search (hard stop)
+  max_llm_calls: 12                     # generator + critic calls per search (hard stop)
+  llm_critic: true                      # optional critic: may lower a score or veto, never raise
+  critic_penalty:                       # score multipliers the critic may choose from
+    minor: 0.9
+    major: 0.7
+  weights:                              # each component is scaled to 0-1; weights sum to 1
+    pop: 0.30                           # (PoP - pop_min) / (1 - pop_min)
+    return_on_risk: 0.25                # credit / max loss, full marks at the scale below
+    risk_headroom: 0.15                 # 1 - position risk / risk block
+    iv_rank: 0.15                       # IV rank (or proxy) / 100; unknown scores 0
+    sr_distance: 0.15                   # short strike beyond support/resistance, % of price
+  return_on_risk_full_scale: 0.50
+  sr_distance_full_scale_pct: 5.0

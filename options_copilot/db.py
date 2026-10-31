@@ -1,4 +1,5 @@
-"""SQLite persistence at data/copilot.db: agent runs, masked traces, briefs, and order tickets.
+"""SQLite persistence at data/copilot.db: agent runs, masked traces, Tree-of-Thought nodes,
+briefs, and order tickets.
 
 Trace rows hold only masked content (see mask.py). Briefs and tickets hold the raw trade
 numbers, which are synthetic in this build and never leave data/.
@@ -22,6 +23,11 @@ CREATE TABLE IF NOT EXISTS trace (
     run_id TEXT NOT NULL REFERENCES runs(run_id), seq INTEGER NOT NULL, role TEXT NOT NULL,
     name TEXT, content TEXT NOT NULL, duration_ms INTEGER, eval_tokens INTEGER, created_at TEXT NOT NULL,
     PRIMARY KEY (run_id, seq)
+);
+CREATE TABLE IF NOT EXISTS tot_nodes (
+    run_id TEXT NOT NULL REFERENCES runs(run_id), node_id TEXT NOT NULL, parent_id TEXT,
+    depth INTEGER NOT NULL, status TEXT NOT NULL, score REAL, prune_reason TEXT, source TEXT,
+    node_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (run_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS briefs (
     brief_id TEXT PRIMARY KEY, run_id TEXT, kind TEXT NOT NULL, ticker TEXT NOT NULL,
@@ -84,6 +90,19 @@ class Database:
     def trace(self, run_id: str) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM trace WHERE run_id = ? ORDER BY seq", (run_id,))
         return [dict(r) for r in rows]
+
+    # Tree-of-Thought nodes (one row per node; node_json is the full serialized node)
+    def save_tot_nodes(self, run_id: str, nodes: list[dict]) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM tot_nodes WHERE run_id = ?", (run_id,))
+            self.conn.executemany(
+                "INSERT INTO tot_nodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(run_id, n["id"], n["parent_id"], n["depth"], n["status"], n["score"], n["prune_reason"],
+                  n["source"], json.dumps(n, default=str), now()) for n in nodes])
+
+    def tot_nodes(self, run_id: str) -> list[dict]:
+        rows = self.conn.execute("SELECT node_json FROM tot_nodes WHERE run_id = ? ORDER BY depth, rowid", (run_id,))
+        return [json.loads(r[0]) for r in rows]
 
     # briefs and tickets
     def save_brief(self, brief_id: str, run_id: str | None, kind: str, ticker: str, status: str,

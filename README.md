@@ -19,6 +19,7 @@ Built for the Carnegie Mellon University Agentic AI course capstone.
 | **Deterministic tools** | Python computes strikes, credit, max loss, breakevens, probability of profit, position risk, and portfolio heat. |
 | **Verifier gate** | A pure rule engine checks every proposal against `playbook.yaml`. Failures go back to the agent as observations. The LLM can add caution but can never override a risk rule. |
 | **RAG landmine check** | Public SEC EDGAR filings (plus local-only headlines) in a Chroma store, hard-filtered by ticker and a 90-day window, with MMR selection. Too little evidence returns `INSUFFICIENT_EVIDENCE`, never `CLEAR`. |
+| **Tree-of-Thought** | Explores strategy -> expiry -> delta as a beam search: LLM generator, deterministic verifier-and-score critic, budgets, `NO_TRADE` if nothing survives. |
 | **Reflexion** | Rejected briefs, verifier rejections, and closed trades produce short lessons stored for later retrieval. |
 | **Memory** | `playbook.yaml` (procedural, read-only), SQLite journal and IV history, Chroma `filings` and `reflections`. |
 | **Mask layer** | Normalizes prices and dollar amounts so the LLM, logs, and traces never see raw account values. |
@@ -52,7 +53,6 @@ python -m options_copilot.cli check MRVL                   # verdict with citati
 python -m options_copilot.cli check MRVL --no-rag          # baseline from model memory only
 python -m options_copilot.cli compare MRVL --save          # both, side by side, saved to demo_outputs/
 python -m options_copilot.cli reflect "lesson text" --ticker MRVL --trigger rejection
-```
 
 # Calculators, verifier, management, screener (Phase 2)
 python -m options_copilot.cli build MSFT                          # iron condor from the live chain, verified
@@ -67,6 +67,7 @@ strikes by delta (0.20-0.30), and widens them inside the band until PoP passes. 
 Advisory checks add CAUTION only. Any missing fact gives `INSUFFICIENT_EVIDENCE`, which fails the
 gate. `--masked` prints the view the LLM gets: account values as % of portfolio and IDs as tokens.
 
+```bash
 # ReAct agent, approval briefs, Reflexion (Phase 3)
 python -m options_copilot.cli brief MSFT                 # agent plans one entry with tools; writes a pending brief
 python -m options_copilot.cli briefs --status pending
@@ -85,6 +86,43 @@ insider BLOCK), the agent is told to stop. Verifier failures, rejections, and (l
 each produce a short Reflexion lesson in the `reflections` collection.
 
 ```bash
+# Tree-of-Thought trade explorer (Phase 4, Module 4)
+python -m options_copilot.cli tot MSFT --save            # explore candidate trades; print the tree
+python -m options_copilot.cli tot MSFT --no-llm          # deterministic generator only
+python -m options_copilot.cli brief MSFT --tot           # brief from the ToT pick, with alternatives considered
+python -m options_copilot.cli tot-compare MSFT --save    # linear ReAct pick vs ToT pick, side by side
+```
+
+### How the Tree-of-Thought explorer decides (generator -> critic -> controller)
+
+`brief TICKER` (ReAct) builds one trade and commits to it. `tot.py` instead searches a small tree
+of partial trade specs: depth 1 is the strategy, depth 2 the expiry (30-60 DTE, before earnings),
+depth 3 the short-delta target inside the strategy's band. Wings stay at the playbook's 3%.
+
+1. **Landmine first.** The filings check runs once per ticker before any branching. `BLOCK` or
+   `INSUFFICIENT_EVIDENCE` ends the search with no tree.
+2. **Generator (LLM role).** For each node Qwen proposes up to `children_per_node` children as
+   schema-constrained JSON, each with a one-line rationale. Python checks every candidate
+   against the playbook and drops (and logs) any that fall outside it; nothing is clamped. If the
+   LLM fails or returns nothing valid, a deterministic enumerator proposes the children.
+3. **Critic (deterministic first).** Each depth-3 leaf runs build -> compute -> verify. A verifier
+   failure, or a build or calculator error, prunes the branch and keeps the reason. Survivors get
+   a 0-1 score from tool numbers only, weighted by `tot.weights` in `playbook.yaml`: PoP, return on
+   risk, position-risk headroom, IV rank, and short-strike distance beyond support/resistance. An
+   optional LLM critic may lower a score (by a playbook penalty factor) or veto a leaf, with a
+   cited reason. It can never raise a score or revive a pruned node.
+4. **Controller.** Beam search keeps `beam_width` nodes per depth (round-robin across parents,
+   leaves by score), with a depth limit and hard budgets on builds and LLM calls; hitting a budget
+   stops the search. The best surviving leaf wins. If nothing survives the result is `NO_TRADE`
+   with the prune reasons; a trade is never forced.
+5. **State.** Every node (spec, rationale, score, prune reason, timing) goes to the `tot_nodes`
+   table under its `runs` row, and LLM calls and builds go to the masked trace.
+
+The verifier also compares event dates in the cited filings (for example an 8-K effective date)
+with the option expiry. Python reads the dates from the cited text; the LLM's statement about
+timing is never used. An event inside the trade window fails the gate; one after expiry adds
+CAUTION.
+
 The first `ingest` or `seed-lessons` run downloads Chroma's built-in MiniLM embedding model
 (about 80 MB, cached under your home directory). `check` and `compare` need Ollama running.
 
@@ -129,6 +167,7 @@ Unit tests block network access, and use fake LLM and data clients.
 | 1 | RAG landmine check (EDGAR ingest, chunking, MMR, coverage check) | done |
 | 2 | Calculators, verifier, management rules, mask, screener | done |
 | 3 | ReAct agent, approval briefs, Reflexion | done |
+| 4 | Tree-of-Thought explorer (Module 4) | done |
 | 4 | Journal, monitor, end-to-end demo | next |
 
 ## License

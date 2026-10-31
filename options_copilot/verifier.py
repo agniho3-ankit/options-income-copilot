@@ -41,6 +41,7 @@ class MarketFacts:
     insider: InsiderActivity | None = None
     landmine: Verdict | None = None
     landmine_reason: str = ""
+    event_dates: tuple[tuple[date, str], ...] = ()  # (date, "event (source)") read by Python from cited filings
     # advisory inputs
     rsi: float | None = None
     iv_rank: float | None = None
@@ -202,6 +203,21 @@ def check_landmine(f: MarketFacts) -> CheckResult:
     return _check("landmine", f.landmine, f.landmine_reason or f"landmine check: {f.landmine.value}")
 
 
+def check_event_window(p: TradeProposal, f: MarketFacts) -> CheckResult:
+    """Cited event dates vs the trade window (as-of to expiry). Dates come from events.py,
+    never from the LLM's reading of the filing."""
+    upcoming = sorted((d, why) for d, why in f.event_dates if d >= f.as_of)
+    inside = [(d, why) for d, why in upcoming if d <= p.expiry]
+    if inside:
+        d, why = inside[0]
+        return _check("event_window", B, f"cited event {why} on {d} falls inside the trade window "
+                                         f"(expiry {p.expiry})")
+    if upcoming:
+        d, why = upcoming[0]
+        return _check("event_window", C, f"cited event {why} on {d} is after expiry {p.expiry}")
+    return _check("event_window", OK, "no cited event date inside the trade window")
+
+
 # --- advisory checks (CAUTION at most) ------------------------------------------------------
 
 def advisory(p: TradeProposal, f: MarketFacts, pb: Playbook) -> list[CheckResult]:
@@ -256,7 +272,7 @@ def verify(p: TradeProposal, f: MarketFacts, pb: Playbook, numbers: TradeNumbers
         check_tier(p, pb), check_price(p, f, pb), check_dte(p, f, pb), check_delta(p, pb),
         check_pop(numbers, pb), check_position_risk(numbers, pb), check_heat(p, numbers, f, pb),
         check_earnings(p, f, pb), check_support_resistance(p, f), check_open_interest(p, pb),
-        check_insider(f, pb), check_landmine(f),
+        check_insider(f, pb), check_landmine(f), check_event_window(p, f),
     ]
     target = check_analyst_target(p, f)
     if target is not None:

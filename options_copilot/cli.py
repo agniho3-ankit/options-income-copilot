@@ -254,7 +254,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     pb = load_playbook(settings.playbook_path)
     as_of = _as_of(args)
     market, edgar = Market(), _edgar_or_none(settings)
-    landmine = None
+    landmine, events = None, ()
     if not args.no_landmine:
         from .agent import landmine_check
         from .llm import build_llm
@@ -263,15 +263,18 @@ def cmd_build(args: argparse.Namespace) -> int:
         cites = "; ".join(f"{c['form']} {c['date']} {c['item']}" for c in lm["citations"])
         landmine = (Verdict(lm["verdict"]), f"landmine {lm['verdict']}" + (f" ({cites})" if cites else "")
                     + (f": {lm['reasons'][0]}" if lm.get("reasons") else ""))
+        from .agent_tools import event_facts
+        events = event_facts(lm)
     iv_rank = None
     out = build_and_verify(args.ticker, Strategy(args.strategy), as_of, pb, market, edgar,
-                           settings.synthetic_portfolio_value, landmine=landmine)
+                           settings.synthetic_portfolio_value, landmine=landmine, event_dates=events)
     if out.expiry and not out.error:
         iv_rank = _atm_iv_proxy(market, args.ticker, out.expiry, out.data.profile.price,
                                 market.history(args.ticker).closes, pb)
         if iv_rank:  # re-run so the advisory IV check sees the proxy
             out = build_and_verify(args.ticker, Strategy(args.strategy), as_of, pb, market, edgar,
-                                   settings.synthetic_portfolio_value, landmine=landmine, iv_rank=iv_rank)
+                                   settings.synthetic_portfolio_value, landmine=landmine, iv_rank=iv_rank,
+                                   event_dates=events)
     text = _render_build(out, settings)
     print(text)
     if args.masked and out.numbers:
@@ -399,10 +402,46 @@ def _render_brief(b: dict) -> str:
         lines.append(f"  lesson: {lesson[:120]}")
     for r in p.get("risks", []):
         lines.append(f"  risk: {r}")
+    if p.get("alternatives"):
+        lines.append("alternatives considered (Tree-of-Thought):")
+        for a in p["alternatives"]:
+            tag = f"score {a['score']}" if a["status"] == "leaf" else a["status"]
+            lines.append(f"  {a['node']:<5}{a['path']:<44}{tag}: {a['reason']}")
     lines.append(f"agent summary: {p.get('summary') or '(none)'}")
     if b.get("decided_at"):
         lines.append(f"decision: {b['status']} at {b['decided_at']}: {b.get('decision_reason')}")
     return "\n".join(lines)
+
+
+def _tot_brief(args, settings, pb, as_of, store, db, masker, box) -> int:
+    from .briefs import make_brief, reflect_on_failures
+    from .llm import build_llm
+    from .react import AgentResult
+    from .tot import alternatives, explore, render_tree, summary_text
+
+    llm = build_llm(settings)
+    result = explore(box, pb, llm, db, masker)
+    lines = [f"run {result.run_id}: Tree-of-Thought {result.outcome}", render_tree(result.tree, result.stats)]
+    brief_id = None
+    if result.selected is not None:
+        brief_id = make_brief(AgentResult(result.run_id, "accepted", summary_text(result)), box, db, as_of,
+                              extra={"planner": "tot", "alternatives": alternatives(result),
+                                     "tot": {"selected": result.selected.id, "score": result.selected.score,
+                                             "components": result.selected.detail.get("components"),
+                                             "stats": result.stats}})
+        lines += ["", _render_brief(db.brief(brief_id)),
+                  f"\nApprove with: copilot approve {brief_id}   or reject with: copilot reject {brief_id} --reason \"...\""]
+    else:
+        lesson = reflect_on_failures(box, llm, store, masker)
+        if lesson is not None:
+            lines.append(f"Reflexion (verifier): {lesson.lesson}")
+        lines.append(f"No brief: {summary_text(result)}")
+    text = "\n".join(lines)
+    print(text)
+    if args.save:
+        _save(settings, f"brief_tot_{box.ticker}_{as_of}", {"run": db.run(result.run_id),
+              "tree": json.loads(result.tree.to_json()), "brief": db.brief(brief_id) if brief_id else None}, text)
+    return 0 if brief_id else 1
 
 
 def cmd_brief(args: argparse.Namespace) -> int:
@@ -422,6 +461,8 @@ def cmd_brief(args: argparse.Namespace) -> int:
     masker = Masker(settings.synthetic_portfolio_value)
     box = ToolBox(args.ticker, LiveSources(pb, as_of, Market(), _edgar_or_none(settings), store, build_llm(settings)),
                   pb, as_of, settings.synthetic_portfolio_value)
+    if args.tot:
+        return _tot_brief(args, settings, pb, as_of, store, db, masker, box)
     task = f"Plan one entry trade on {box.ticker} as of {as_of.isoformat()}."
     result = run_agent(task, box, llm, db, masker, pb, max_steps=args.max_steps)
     lines = [f"run {result.run_id}: {result.outcome} after {result.stats['steps']} step(s), "
@@ -449,6 +490,116 @@ def cmd_brief(args: argparse.Namespace) -> int:
         _save(settings, f"brief_{box.ticker}_{as_of}", {"run": db.run(result.run_id), "trace": db.trace(result.run_id),
               "brief": db.brief(brief_id) if brief_id else None}, text)
     return 0 if brief_id else 1
+
+
+def _live_box(settings, pb, as_of, ticker, cached=False):
+    from .agent_tools import ToolBox
+    from .llm import build_llm
+    from .market import Market
+    from .tools import CachedSources, LiveSources
+
+    src = LiveSources(pb, as_of, Market(), _edgar_or_none(settings), _store(settings), build_llm(settings))
+    return ToolBox(ticker, CachedSources(src) if cached else src, pb, as_of, settings.synthetic_portfolio_value)
+
+
+def cmd_tot(args: argparse.Namespace) -> int:
+    from .llm import build_llm
+    from .mask import Masker
+    from .tot import explore, render_tree, summary_text
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db = _db(settings)
+    box = _live_box(settings, pb, as_of, args.ticker)
+    result = explore(box, pb, None if args.no_llm else build_llm(settings), db,
+                     Masker(settings.synthetic_portfolio_value), use_critic=False if args.no_critic else None)
+    text = "\n".join([f"== Tree-of-Thought {box.ticker} as of {as_of} | run {result.run_id} | {result.outcome} ==",
+                      render_tree(result.tree, result.stats), summary_text(result),
+                      "(no brief written; use `brief TICKER --tot` to write one)"])
+    print(text)
+    if args.save:
+        _save(settings, f"tot_{box.ticker}_{as_of}", {"run": db.run(result.run_id), "outcome": result.outcome,
+              "reasons": result.reasons, "stats": result.stats, "tree": json.loads(result.tree.to_json())}, text)
+    return 0
+
+
+def _prewarm(box, pb) -> None:
+    """Fetch market data, the landmine verdict, and every eligible chain before timing."""
+    from .market import eligible_expiries
+    d = box._data()
+    box.search_filings()
+    for e in eligible_expiries(box.sources.expiries(box.ticker), box.as_of, pb["entry.dte_min"], pb["entry.dte_max"],
+                               pb["entry.dte_target"], d.profile.earnings_date):
+        box.sources.chain(box.ticker, e)
+
+
+def cmd_tot_compare(args: argparse.Namespace) -> int:
+    import time
+
+    from .agent_tools import ToolBox
+    from .llm import build_llm
+    from .mask import Masker
+    from .react import run_agent
+    from .tot import explore, render_tree, score_proposal
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db = _db(settings)
+    masker = Masker(settings.synthetic_portfolio_value)
+    shared = _live_box(settings, pb, as_of, args.ticker, cached=True)
+    _prewarm(shared, pb)  # both planners then see identical data and one landmine verdict
+    fresh = lambda: ToolBox(shared.ticker, shared.sources, pb, as_of, settings.synthetic_portfolio_value)  # noqa: E731
+
+    def pick(box) -> dict:
+        if box.accepted is None:
+            return {"trade": None, "verdict": None, "score": None}
+        pid, res = box.accepted
+        prop = box.proposals[pid]
+        legs = " ".join(f"{g.side.value[0]}{g.option_type.value[0].upper()}{g.strike:g}" for g in prop.proposal.legs)
+        return {"trade": f"{prop.proposal.strategy.value} {prop.proposal.expiry} {legs}", "verdict": res.verdict.value,
+                "pop": prop.numbers.pop, "score": score_proposal(box, pb, pid)[0]}
+
+    rbox = fresh()
+    t0 = time.monotonic()
+    react = run_agent(f"Plan one entry trade on {rbox.ticker} as of {as_of.isoformat()}.", rbox,
+                      build_llm(settings, num_ctx=16384), db, masker, pb, max_steps=args.max_steps)
+    react_ms = int((time.monotonic() - t0) * 1000)
+    linear = {"planner": "ReAct (linear)", "run_id": react.run_id, "outcome": react.outcome,
+              "nodes_explored": len(rbox.proposals),
+              "nodes_pruned": sum(not r.passed for _, r in rbox.submissions),
+              "llm_calls": react.stats["steps"], "latency_ms": react_ms, **pick(rbox)}
+
+    tbox = fresh()
+    tot = explore(tbox, pb, build_llm(settings), db, masker)
+    tree = {"planner": "Tree-of-Thought", "run_id": tot.run_id, "outcome": tot.outcome,
+            "nodes_explored": tot.stats["nodes"], "nodes_pruned": tot.stats["pruned"],
+            "llm_calls": tot.stats["llm_calls"], "latency_ms": tot.stats["latency_ms"], **pick(tbox),
+            "critic_score": tot.selected.score if tot.selected else None}
+
+    rows = [("outcome", "outcome"), ("nodes explored", "nodes_explored"), ("nodes pruned", "nodes_pruned"),
+            ("LLM calls", "llm_calls"), ("latency (s)", "latency_ms"), ("chosen trade", "trade"),
+            ("verifier", "verdict"), ("PoP", "pop"), ("score", "score"), ("score w/ critic", "critic_score")]
+
+    def fmt(key, v):
+        if v is None:
+            return "-"
+        return f"{v / 1000:.1f}" if key == "latency_ms" else f"{v:.1%}" if key == "pop" else str(v)
+    lines = [f"== ReAct vs Tree-of-Thought: {shared.ticker} as of {as_of} ==",
+             f"filings verdict {shared.landmine_result['verdict']} (one shared check); data prefetched, so latency "
+             "is planning only. Scores use the same deterministic tot.weights for both picks.",
+             "score = deterministic tot.weights score of the chosen trade; the ToT critic may only lower it.",
+             f"{'':<17}{'ReAct (linear)':<52}{'Tree-of-Thought':<52}"]
+    for label, key in rows:
+        lines.append(f"{label:<17}{fmt(key, linear.get(key)):<52}{fmt(key, tree.get(key)):<52}".rstrip())
+    lines += ["", "ToT tree:", render_tree(tot.tree, tot.stats)]
+    text = "\n".join(lines)
+    print(text)
+    if args.save:
+        _save(settings, f"tot_compare_{shared.ticker}_{as_of}", {"react": linear, "tot": tree,
+              "react_trace": db.trace(react.run_id), "tot_tree": json.loads(tot.tree.to_json())}, text)
+    return 0
 
 
 def cmd_briefs(args: argparse.Namespace) -> int:
@@ -571,9 +722,25 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("brief", help="run the ReAct agent to plan one entry and write a brief")
     p.add_argument("ticker")
     p.add_argument("--max-steps", type=int, default=14)
+    p.add_argument("--tot", action="store_true", help="plan with the Tree-of-Thought explorer instead of ReAct")
     p.add_argument("--as-of")
     p.add_argument("--save", action="store_true")
     p.set_defaults(func=cmd_brief)
+
+    p = sub.add_parser("tot", help="explore candidate trades as a Tree-of-Thought and print the tree")
+    p.add_argument("ticker")
+    p.add_argument("--as-of")
+    p.add_argument("--no-llm", action="store_true", help="deterministic generator only (no LLM calls)")
+    p.add_argument("--no-critic", action="store_true", help="skip the optional LLM critic")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_tot)
+
+    p = sub.add_parser("tot-compare", help="linear ReAct pick vs Tree-of-Thought pick, side by side")
+    p.add_argument("ticker")
+    p.add_argument("--as-of")
+    p.add_argument("--max-steps", type=int, default=14)
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_tot_compare)
 
     p = sub.add_parser("briefs", help="list briefs")
     p.add_argument("--status", choices=["pending", "approved", "rejected"])

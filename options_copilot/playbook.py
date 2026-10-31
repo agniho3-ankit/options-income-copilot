@@ -115,6 +115,21 @@ SPEC: dict[str, Rule] = {
     "iv_rank.full_history_days": _days(20, 2000),
     "iv_rank.percentile_min_snapshots": _days(2, 2000),
     "iv_rank.realized_vol_window_days": _days(5, 400),
+    "tot.beam_width": Rule(int, 1, 10),
+    "tot.max_depth": Rule(int, 1, 3),
+    "tot.children_per_node": Rule(int, 1, 6),
+    "tot.max_builds": Rule(int, 1, 200),
+    "tot.max_llm_calls": Rule(int, 0, 100),
+    "tot.llm_critic": Rule(bool),
+    "tot.critic_penalty.minor": Rule(NUM, 0.01, 1),
+    "tot.critic_penalty.major": Rule(NUM, 0.01, 1),
+    "tot.weights.pop": Rule(NUM, 0, 1),
+    "tot.weights.return_on_risk": Rule(NUM, 0, 1),
+    "tot.weights.risk_headroom": Rule(NUM, 0, 1),
+    "tot.weights.iv_rank": Rule(NUM, 0, 1),
+    "tot.weights.sr_distance": Rule(NUM, 0, 1),
+    "tot.return_on_risk_full_scale": Rule(NUM, 0.01, 10),
+    "tot.sr_distance_full_scale_pct": _pct(50),
 }
 
 
@@ -173,6 +188,13 @@ def _check_consistency(v: dict[str, Any]) -> list[str]:
     weights = sum(v[k] for k in v if k.startswith("screener.quality_weights."))
     if abs(weights - 10) > 1e-9:
         errors.append(f"screener.quality_weights must sum to 10, got {weights}")
+
+    tot_weights = sum(v[k] for k in v if k.startswith("tot.weights."))
+    if abs(tot_weights - 1) > 1e-9:
+        errors.append(f"tot.weights must sum to 1, got {tot_weights:g}")
+    less("tot.critic_penalty.major", "tot.critic_penalty.minor", strict=False)
+    if v["tot.sr_distance_full_scale_pct"] <= 0:
+        errors.append("tot.sr_distance_full_scale_pct must be above 0")
 
     seen: dict[str, str] = {}
     for group in ("universe.tier_1", "universe.tier_2", "universe.watch"):

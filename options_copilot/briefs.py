@@ -17,8 +17,10 @@ from .react import AgentResult
 from .reflexion import write_lesson
 
 
-def make_brief(result: AgentResult, box: ToolBox, db: Database, as_of: date) -> str | None:
-    """Store a pending entry brief if the verifier accepted a trade. Returns the brief ID."""
+def make_brief(result: AgentResult, box: ToolBox, db: Database, as_of: date,
+               extra: dict[str, Any] | None = None) -> str | None:
+    """Store a pending entry brief if the verifier accepted a trade. Returns the brief ID.
+    `extra` adds fields such as the Tree-of-Thought alternatives."""
     parts = box.accepted_brief_parts()
     if parts is None:
         return None
@@ -32,6 +34,7 @@ def make_brief(result: AgentResult, box: ToolBox, db: Database, as_of: date) -> 
         "citations": lm.get("citations", []), "landmine_verdict": lm.get("verdict"),
         "lessons": box.lessons_used, "risks": risks, "synthetic_portfolio": True,
         "submissions": [{"proposal_id": pid, "verdict": r.verdict.value} for pid, r in box.submissions],
+        **(extra or {}),
     }
     db.save_brief(brief_id, result.run_id, "entry", box.ticker, "pending", parts["verdict"], payload)
     return brief_id

@@ -134,6 +134,13 @@ def pick_expiry(expiries: list[date], as_of: date, dte_min: int, dte_max: int, d
     inside = [e for e in expiries if dte_min <= (e - as_of).days <= dte_max]
     if not inside:
         return None
-    before = [e for e in inside if earnings is None or e < earnings]
-    pool = before or inside
+    pool = eligible_expiries(inside, as_of, dte_min, dte_max, dte_target, earnings) or inside
     return min(pool, key=lambda e: (abs((e - as_of).days - dte_target), e))
+
+
+def eligible_expiries(expiries: list[date], as_of: date, dte_min: int, dte_max: int, dte_target: int,
+                      earnings: date | None) -> list[date]:
+    """Expiries inside [dte_min, dte_max] and before earnings (if known), nearest the target first.
+    Unlike pick_expiry there is no after-earnings fallback: those would fail the verifier."""
+    ok = [e for e in expiries if dte_min <= (e - as_of).days <= dte_max and (earnings is None or e < earnings)]
+    return sorted(ok, key=lambda e: (abs((e - as_of).days - dte_target), e))

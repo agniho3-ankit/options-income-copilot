@@ -74,7 +74,8 @@ class BuildOutcome:
 def build_and_verify(ticker: str, strategy: Strategy, as_of: date, pb: Playbook, market: Market,
                      edgar: EdgarClient | None, portfolio_value: float,
                      open_max_losses: tuple[float, ...] = (), landmine: tuple[Verdict, str] | None = None,
-                     iv_rank: tuple[float, str] | None = None) -> BuildOutcome:
+                     iv_rank: tuple[float, str] | None = None,
+                     event_dates: tuple[tuple[date, str], ...] = ()) -> BuildOutcome:
     data = gather(ticker, as_of, pb, market, edgar)
     out = BuildOutcome(ticker.upper(), as_of, strategy, data)
     prof = data.profile
@@ -97,6 +98,7 @@ def build_and_verify(ticker: str, strategy: Strategy, as_of: date, pb: Playbook,
         earnings_date=prof.earnings_date, support=data.support, resistance=data.resistance,
         analyst_target=prof.analyst_target, insider=data.insider,
         landmine=landmine[0] if landmine else None, landmine_reason=landmine[1] if landmine else "",
+        event_dates=event_dates,
         rsi=data.rsi14, iv_rank=iv_rank[0] if iv_rank else None, iv_rank_label=iv_rank[1] if iv_rank else "",
         sma50=data.sma50, sma200=data.sma200, ex_dividend_date=prof.ex_dividend_date, max_vol_oi_ratio=flow)
     out.verifier = verify(out.proposal, facts, pb, out.numbers)
@@ -121,6 +123,34 @@ def screen_ticker(ticker: str, as_of: date, pb: Playbook, market: Market, edgar:
                           analyst_target=p.analyst_target, sma200=data.sma200, net_income_positive=income_ok,
                           revenue_growth=growth, insider=data.insider, reverse_split_recent=reverse)
     return screen(inputs, pb), data
+
+
+class CachedSources:
+    """Memoizes another source so two planners (ReAct vs ToT) see identical data and one
+    landmine verdict. Lessons pass through."""
+
+    def __init__(self, inner):
+        self.inner, self._cache = inner, {}
+
+    def _get(self, key, fn):
+        if key not in self._cache:
+            self._cache[key] = fn()
+        return self._cache[key]
+
+    def ticker_data(self, ticker):
+        return self._get(("data", ticker), lambda: self.inner.ticker_data(ticker))
+
+    def expiries(self, ticker):
+        return self._get(("exp", ticker), lambda: self.inner.expiries(ticker))
+
+    def chain(self, ticker, expiry):
+        return self._get(("chain", ticker, expiry), lambda: self.inner.chain(ticker, expiry))
+
+    def landmine(self, ticker, context):
+        return self._get(("lm", ticker), lambda: self.inner.landmine(ticker, context))
+
+    def lessons(self, ticker, query):
+        return self.inner.lessons(ticker, query)
 
 
 class LiveSources:

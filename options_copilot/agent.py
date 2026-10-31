@@ -17,6 +17,7 @@ import re
 from datetime import date
 from typing import Any
 
+from .events import event_dates_from_chunks
 from .llm import LLMClient, LLMError
 from .models import Reflection, RetrievedChunk, Verdict, from_yyyymmdd
 from .store import RetrievalResult, Store
@@ -174,7 +175,7 @@ def landmine_check(ticker: str, trade_context: str, use_retrieval: bool = True, 
                               "window": [retrieval.window_start.isoformat(), retrieval.window_end.isoformat()]}
         if not cov.ok:
             result.update(verdict=Verdict.INSUFFICIENT_EVIDENCE.value, llm_verdict=None,
-                          reasons=[f"Coverage check failed: {cov.reason}."], citations=[], lessons=[],
+                          reasons=[f"Coverage check failed: {cov.reason}."], citations=[], lessons=[], event_dates=[],
                           guard_notes=["LLM not asked: too little evidence to judge; escalate to the owner"])
             return result
         lessons = store.search_lessons(ticker, query)
@@ -198,6 +199,7 @@ def landmine_check(ticker: str, trade_context: str, use_retrieval: bool = True, 
         evidence=[{"id": cid, **c.citation(), "score": c.score, "excerpt": c.text[:240]}
                   for cid, c in by_id.items()],
         lessons=[r.lesson for r in lessons],
+        event_dates=event_dates_from_chunks(cited),  # read by Python, not the LLM
         guard_notes=notes,
     )
     return result

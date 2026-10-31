@@ -52,7 +52,8 @@ def test_observations_and_trace_are_masked(pb, db):
     llm = ScriptedLLM(HAPPY)
     res = run_agent("Plan one entry.", b, llm, db, Masker(pv), pb)
     numbers = b.proposals["P1"].numbers
-    trace_text = json.dumps(db.trace(res.run_id))
+    # content only: run ids and timestamps are random/clock digits, not trade values
+    trace_text = json.dumps([r["content"] for r in db.trace(res.run_id)])
     sent_text = json.dumps(llm.sent)
     for text in (trace_text, sent_text):
         assert find_leaks(text, [numbers.credit, numbers.max_loss, pv]) == []
