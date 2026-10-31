@@ -288,6 +288,20 @@ class Reflection:
     synthetic: bool = True
 
 
+def leg_from_dict(d: dict[str, Any]) -> OptionLeg:
+    return OptionLeg(OptionType(d["option_type"]), Side(d["side"]), float(d["strike"]),
+                     date.fromisoformat(d["expiry"]), float(d["bid"]), float(d["ask"]), d.get("delta"),
+                     d.get("iv"), d.get("open_interest"))
+
+
+def position_from_dict(d: dict[str, Any]) -> Position:
+    return Position(d["position_id"], d["ticker"], Strategy(d["strategy"]),
+                    tuple(leg_from_dict(g) for g in d["legs"]), date.fromisoformat(d["opened_on"]),
+                    float(d["entry_credit"]), float(d["entry_max_loss"]), int(d.get("contracts", 1)),
+                    PositionStatus(d.get("status", "open")), d.get("entry_spot"), d.get("entry_iv"),
+                    bool(d.get("synthetic", True)))
+
+
 def to_jsonable(obj: Any) -> Any:
     """Convert models (and nested enums, dates, tuples) into plain JSON-ready values."""
     if is_dataclass(obj) and not isinstance(obj, type):

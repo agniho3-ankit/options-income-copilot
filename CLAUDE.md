@@ -60,6 +60,8 @@ python -m options_copilot.cli playbook     # validate playbook.yaml
   Phase 3: `react.py` (ReAct loop), `agent_tools.py` (tool registry, one ticker per run), `db.py`
   (SQLite runs/trace/briefs/tickets), `briefs.py` (make/approve/reject), `reflexion.py`
   Phase 4: `tot.py` (Tree-of-Thought explorer, `tot_nodes` table), `events.py` (cited event dates)
+  `broker.py` (PaperBroker), `journal.py` (Skill #7 log), `monitor.py` (rules -> decision -> exit/roll
+  brief), `sim.py` (simulated clock, demo only), `demo.py` (end-to-end demo)
 - `playbook.yaml`: the rules (procedural memory), validated strictly by `playbook.py`
 - `scripts/privacy_audit.py`: stdlib pre-commit privacy scan
 - `tests/`: pytest, network blocked by `conftest.py`

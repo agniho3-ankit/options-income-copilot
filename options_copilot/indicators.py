@@ -84,3 +84,28 @@ def iv_rank_proxy(atm_iv: float, realized: float) -> float:
     if realized <= 0:
         raise ValueError("realized vol must be positive")
     return max(0.0, min(100.0, (atm_iv / realized - 0.75) / 0.75 * 100))
+
+
+def atm_iv(quotes, spot: float, n: int = 4) -> float | None:
+    """Average IV of the `n` strikes nearest the money (puts and calls together)."""
+    near = sorted((q for q in quotes if q.iv), key=lambda q: abs(q.strike - spot))[:n]
+    return sum(q.iv for q in near) / len(near) if near else None
+
+
+def iv_rank_from_history(current: float, history: list[float], realized: float | None, pb) -> tuple[float, str] | None:
+    """IV Rank once a full year of daily snapshots exists, IV percentile once
+    `percentile_min_snapshots` exist, else the ATM-IV / realized-vol proxy. Returns
+    (0-100 value, label) or None when not even the proxy is available."""
+    full, min_n = pb["iv_rank.full_history_days"], pb["iv_rank.percentile_min_snapshots"]
+    hist = list(history)[-full:]
+    if len(hist) >= full:
+        lo, hi = min(hist), max(hist)
+        rank = 50.0 if hi == lo else (current - lo) / (hi - lo) * 100
+        return max(0.0, min(100.0, rank)), f"IV rank over {len(hist)} daily snapshots"
+    if len(hist) >= min_n:
+        pct = sum(v < current for v in hist) / len(hist) * 100
+        return pct, f"IV percentile over {len(hist)} daily snapshots (rank needs {full})"
+    if realized:
+        return (iv_rank_proxy(current, realized),
+                f"proxy: ATM IV {current:.0%} / 30d RV {realized:.0%}, {len(hist)} IV snapshots so far")
+    return None

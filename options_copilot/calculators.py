@@ -39,6 +39,41 @@ def bs_delta(spot: float, strike: float, iv: float, t: float, option_type: Optio
     return norm_cdf(d1) if option_type is OptionType.CALL else norm_cdf(d1) - 1.0
 
 
+def bs_price(spot: float, strike: float, iv: float, t: float, option_type: OptionType, r: float = 0.0) -> float:
+    """Black-Scholes premium per share (intrinsic value at or after expiry)."""
+    if spot <= 0 or strike <= 0:
+        raise CalcError("spot and strike must be positive")
+    if t <= 0 or iv <= 0:
+        return max(spot - strike, 0.0) if option_type is OptionType.CALL else max(strike - spot, 0.0)
+    sq = iv * math.sqrt(t)
+    d1 = (math.log(spot / strike) + (r + iv * iv / 2) * t) / sq
+    d2 = d1 - sq
+    disc = math.exp(-r * t)
+    if option_type is OptionType.CALL:
+        return spot * norm_cdf(d1) - strike * disc * norm_cdf(d2)
+    return strike * disc * norm_cdf(-d2) - spot * norm_cdf(-d1)
+
+
+def limit_credit_per_share(credit_per_contract: float) -> float:
+    """Limit price for a credit order: the mid rounded DOWN to the cent, so it sits at or
+    below the market and can fill at the price the brief showed."""
+    return math.floor(credit_per_contract / MULTIPLIER * 100 + 1e-6) / 100
+
+
+def limit_debit_per_share(debit_per_contract: float) -> float:
+    """Limit price for a debit (closing) order: the mid rounded UP to the cent."""
+    return math.ceil(debit_per_contract / MULTIPLIER * 100 - 1e-6) / 100
+
+
+def intrinsic_close_cost(legs: tuple[OptionLeg, ...], spot: float) -> float:
+    """Debit per contract to settle legs at expiry: shorts' intrinsic minus longs'."""
+    total = 0.0
+    for g in legs:
+        v = max(spot - g.strike, 0.0) if g.option_type is OptionType.CALL else max(g.strike - spot, 0.0)
+        total += v if g.side is Side.SHORT else -v
+    return round(total * MULTIPLIER, 2)
+
+
 def prob_above(spot: float, level: float, iv: float, t: float, r: float = 0.0) -> float:
     """Risk-neutral P(S_T > level) under a lognormal model (N(d2))."""
     if level <= 0:

@@ -9,6 +9,7 @@ from datetime import date
 from typing import Any
 
 from .agent_tools import ToolBox
+from .calculators import limit_credit_per_share
 from .db import Database, new_id
 from .llm import LLMClient
 from .mask import Masker
@@ -52,20 +53,34 @@ def reflect_on_failures(box: ToolBox, llm: LLMClient | None, store: Any, masker:
                         llm=llm, store=store, masker=masker, tags=["verifier", *checks])
 
 
+def _entry_ticket(prop: dict, numbers: dict) -> dict:
+    return {"ticker": prop["ticker"], "strategy": prop["strategy"], "contracts": prop["contracts"],
+            "order_type": "limit", "limit_credit_per_share": limit_credit_per_share(numbers["credit"]), "legs": prop["legs"],
+            "credit_at_brief": numbers["credit"], "max_loss_at_brief": numbers["max_loss"]}
+
+
 def approve(db: Database, brief_id: str, note: str = "") -> str:
+    """The human approval step. Writes a paper order ticket; the PaperBroker simulates the fill."""
     b = db.brief(brief_id)
     if b is None:
         raise ValueError(f"no brief {brief_id}")
     if b["status"] != "pending":
         raise ValueError(f"brief {brief_id} is {b['status']}, not pending")
-    if b["verdict"] not in ("CLEAR", "CAUTION"):
-        raise ValueError(f"brief {brief_id} did not pass the verifier ({b['verdict']})")
     p = b["payload"]
-    prop = p["proposal"]
-    ticket = {"brief_id": brief_id, "ticker": b["ticker"], "strategy": prop["strategy"],
-              "contracts": prop["contracts"], "order_type": "limit", "limit_credit_per_share":
-              round(p["numbers"]["credit"] / 100, 2), "legs": prop["legs"], "paper_only": True,
-              "synthetic": True, "note": note}
+    kind = b["kind"]
+    if kind in ("entry", "roll") and b["verdict"] not in ("CLEAR", "CAUTION"):
+        raise ValueError(f"brief {brief_id} did not pass the verifier ({b['verdict']})")
+    base = {"kind": kind, "brief_id": brief_id, "ticker": b["ticker"], "paper_only": True, "synthetic": True,
+            "note": note}
+    if kind == "entry":
+        ticket = {**base, **_entry_ticket(p["proposal"], p["numbers"])}
+    elif kind in ("exit", "roll"):
+        close = {"position_id": p["position_id"], "limit_debit_per_share": p["limit_debit_per_share"],
+                 "exit_rule": p["exit_rule"], "order_type": "limit"}
+        ticket = {**base, **close} if kind == "exit" else {
+            **base, "close": close, "open": _entry_ticket(p["new"]["proposal"], p["new"]["numbers"])}
+    else:
+        raise ValueError(f"brief {brief_id} has unknown kind {kind}")
     db.decide(brief_id, "approved", note or "approved")
     return db.add_ticket(brief_id, ticket)
 
@@ -79,5 +94,6 @@ def reject(db: Database, brief_id: str, reason: str, *, llm: LLMClient | None, s
     db.decide(brief_id, "rejected", reason)
     p = b["payload"]
     return write_lesson(ReflectionTrigger.REJECTION, b["ticker"],
-                        {"strategy": p["proposal"]["strategy"], "reason": reason, "risks": p.get("risks", [])},
+                        {"strategy": p["proposal"]["strategy"] if "proposal" in p else p.get("strategy"),
+                         "brief_kind": b["kind"], "reason": reason, "risks": p.get("risks", [])},
                         llm=llm, store=store, masker=masker, tags=["rejection"])

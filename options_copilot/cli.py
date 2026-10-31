@@ -383,6 +383,43 @@ def _db(settings):
 
 
 def _render_brief(b: dict) -> str:
+    if b["kind"] in ("exit", "roll"):
+        return _render_exit(b)
+    return _render_entry(b)
+
+
+def _render_exit(b: dict) -> str:
+    p = b["payload"]
+    d = p["decision"]
+    lines = [f"== Brief {b['brief_id']} [{b['status'].upper()}] {b['kind']} {b['ticker']} ({p['position_id']}) ==",
+             f"as of {p['as_of']} | spot {p['spot']} | {p['dte']} DTE | run {p['run_id']}"
+             + (f" | {p['simulated']}" if p.get("simulated") else "")]
+    lines.append(f"position: {p['strategy']} " + " ".join(
+        f"{g['side']} {g['option_type']} {g['strike']:g}" for g in p["legs"]) + f" exp {p['legs'][0]['expiry']}")
+    lines.append(f"close (calculators, mid): debit ${p['close_cost']:.2f} per contract -> limit "
+                 f"{p['limit_debit_per_share']:.2f}/share; entry credit ${p['entry_credit']:.2f}; est. P&L "
+                 f"${p['est_pnl']:.2f} ({p['profit_pct']}% of max profit)")
+    lines.append("rules fired:")
+    for t in p["triggers"]:
+        lines.append(f"  {t['rule']:<18}{t['action']:<18}{t['reason']}")
+    if p["not_evaluated"]:
+        lines.append(f"not evaluated (missing data): {', '.join(p['not_evaluated'])}")
+    lines.append(f"decision: {d['action']} (by {d['chosen_by']}; options {', '.join(d['options'])}): {d['rationale']}")
+    for n in d["notes"]:
+        lines.append(f"  note: {n}")
+    if b["kind"] == "roll":
+        new = p["new"]
+        lines.append("roll into (Tree-of-Thought pick, verified):")
+        lines.append("  " + _render_entry({"brief_id": b["brief_id"], "status": b["status"], "kind": "new leg",
+                                           "ticker": b["ticker"], "verdict": b["verdict"],
+                                           "payload": {**new, "as_of": p["as_of"], "run_id": new["tot_run_id"]}}
+                                          ).replace("\n", "\n  "))
+    if b.get("decided_at"):
+        lines.append(f"decision: {b['status']} at {b['decided_at']}: {b.get('decision_reason')}")
+    return "\n".join(lines)
+
+
+def _render_entry(b: dict) -> str:
     p = b["payload"]
     prop, n = p["proposal"], p["numbers"]
     lines = [f"== Brief {b['brief_id']} [{b['status'].upper()}] {b['kind']} {b['ticker']} ==",
@@ -406,7 +443,7 @@ def _render_brief(b: dict) -> str:
         lines.append("alternatives considered (Tree-of-Thought):")
         for a in p["alternatives"]:
             tag = f"score {a['score']}" if a["status"] == "leaf" else a["status"]
-            lines.append(f"  {a['node']:<5}{a['path']:<44}{tag}: {a['reason']}")
+            lines.append(f"  {a['node']:<5}{a['path']:<52}{tag}: {a['reason']}")
     lines.append(f"agent summary: {p.get('summary') or '(none)'}")
     if b.get("decided_at"):
         lines.append(f"decision: {b['status']} at {b['decided_at']}: {b.get('decision_reason')}")
@@ -460,7 +497,8 @@ def cmd_brief(args: argparse.Namespace) -> int:
     db = _db(settings)
     masker = Masker(settings.synthetic_portfolio_value)
     box = ToolBox(args.ticker, LiveSources(pb, as_of, Market(), _edgar_or_none(settings), store, build_llm(settings)),
-                  pb, as_of, settings.synthetic_portfolio_value)
+                  pb, as_of, settings.synthetic_portfolio_value, open_max_losses=_open_losses(db),
+                  iv_history=tuple(v for _, v in db.iv_history(args.ticker.upper())))
     if args.tot:
         return _tot_brief(args, settings, pb, as_of, store, db, masker, box)
     task = f"Plan one entry trade on {box.ticker} as of {as_of.isoformat()}."
@@ -499,7 +537,9 @@ def _live_box(settings, pb, as_of, ticker, cached=False):
     from .tools import CachedSources, LiveSources
 
     src = LiveSources(pb, as_of, Market(), _edgar_or_none(settings), _store(settings), build_llm(settings))
-    return ToolBox(ticker, CachedSources(src) if cached else src, pb, as_of, settings.synthetic_portfolio_value)
+    db = _db(settings)
+    return ToolBox(ticker, CachedSources(src) if cached else src, pb, as_of, settings.synthetic_portfolio_value,
+                   open_max_losses=_open_losses(db), iv_history=tuple(v for _, v in db.iv_history(ticker.upper())))
 
 
 def cmd_tot(args: argparse.Namespace) -> int:
@@ -550,7 +590,8 @@ def cmd_tot_compare(args: argparse.Namespace) -> int:
     masker = Masker(settings.synthetic_portfolio_value)
     shared = _live_box(settings, pb, as_of, args.ticker, cached=True)
     _prewarm(shared, pb)  # both planners then see identical data and one landmine verdict
-    fresh = lambda: ToolBox(shared.ticker, shared.sources, pb, as_of, settings.synthetic_portfolio_value)  # noqa: E731
+    fresh = lambda: ToolBox(shared.ticker, shared.sources, pb, as_of, settings.synthetic_portfolio_value,  # noqa: E731
+                            open_max_losses=shared.open_max_losses, iv_history=shared.iv_history)
 
     def pick(box) -> dict:
         if box.accepted is None:
@@ -600,6 +641,151 @@ def cmd_tot_compare(args: argparse.Namespace) -> int:
         _save(settings, f"tot_compare_{shared.ticker}_{as_of}", {"react": linear, "tot": tree,
               "react_trace": db.trace(react.run_id), "tot_tree": json.loads(tot.tree.to_json())}, text)
     return 0
+
+
+def _open_losses(db) -> tuple[float, ...]:
+    from .broker import open_positions
+    return tuple(p.entry_max_loss * p.contracts for p in open_positions(db))
+
+
+def _live_sources(settings, pb, as_of):
+    from .llm import build_llm
+    from .market import Market
+    from .tools import CachedSources, LiveSources
+    return CachedSources(LiveSources(pb, as_of, Market(), _edgar_or_none(settings), _store(settings), build_llm(settings)))
+
+
+def cmd_fill(args: argparse.Namespace) -> int:
+    from .broker import PaperBroker
+    from .llm import build_llm
+    from .mask import Masker
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db = _db(settings)
+    broker = PaperBroker(db, _live_sources(settings, pb, as_of), as_of, llm=build_llm(settings),
+                         store=_store(settings), masker=Masker(settings.synthetic_portfolio_value))
+    tickets = [db.ticket(args.ticket_id)] if args.ticket_id else db.tickets("approved")
+    if not tickets or tickets == [None]:
+        print("no approved tickets to fill")
+        return 0
+    for t in tickets:
+        f = broker.process(t)
+        print(f"{f.ticket_id}: {f.status.upper()}  {f.message}")
+    return 0
+
+
+def cmd_positions(args: argparse.Namespace) -> int:
+    from .models import position_from_dict
+    db = _db(load_settings())
+    rows = db.positions(None if args.all else "open")
+    if not rows:
+        print("no positions" if args.all else "no open positions")
+    for r in rows:
+        p = position_from_dict(r["payload"])
+        legs = " ".join(f"{g.side.value[0]}{g.option_type.value[0].upper()}{g.strike:g}" for g in p.legs)
+        print(f"{r['position_id']}  {r['status']:<7}{p.ticker:<6}{p.strategy.value:<19}{legs:<30} exp {p.expiry}  "
+              f"opened {p.opened_on}  credit {p.entry_credit:.2f}  max loss {p.entry_max_loss:.2f}  (synthetic)")
+    return 0
+
+
+def cmd_journal(args: argparse.Namespace) -> int:
+    from .journal import metrics, render
+    settings = load_settings()
+    db = _db(settings)
+    rows = db.journal()
+    m = metrics(rows, args.month)
+    text = render([r for r in rows if not args.month or r["date_opened"].startswith(args.month)], m)
+    print(text)
+    if args.save:
+        _save(settings, f"journal_{args.month or 'all'}", {"rows": rows, "metrics": m}, text)
+    return 0
+
+
+def cmd_iv_snapshot(args: argparse.Namespace) -> int:
+    from .indicators import atm_iv
+    from .market import Market
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db, market = _db(settings), Market()
+    tickers = [t.upper() for t in args.tickers] or _universe(settings)
+    for t in tickers:
+        try:
+            spot = market.profile(t, as_of).price
+            exps = [e for e in market.expiries(t) if (e - as_of).days >= 20]
+            if not exps:
+                raise ValueError("no expiry 20+ days out")
+            exp = min(exps, key=lambda e: abs((e - as_of).days - 30))   # constant ~30-day maturity
+            iv = atm_iv(market.chain(t, exp)[0], spot)
+            if iv is None:
+                raise ValueError("no IV near the money")
+        except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop the job
+            print(f"{t}: skipped ({exc})")
+            continue
+        db.add_iv_snapshot(t, as_of.isoformat(), round(iv, 4), exp.isoformat(), (exp - as_of).days)
+        n = len(db.iv_history(t))
+        print(f"{t}: ATM IV {iv:.1%} ({exp}, {(exp - as_of).days} DTE); {n} snapshot(s), "
+              f"percentile from {pb['iv_rank.percentile_min_snapshots']}, rank from {pb['iv_rank.full_history_days']}")
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    from .llm import build_llm
+    from .mask import Masker
+    from .monitor import render, run_monitor
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db = _db(settings)
+    masker = Masker(settings.synthetic_portfolio_value)
+    llm = None if args.no_llm else build_llm(settings)
+    run_id, items, summary = run_monitor(db, _live_sources(settings, pb, as_of), pb, as_of, llm=llm, masker=masker,
+                                         portfolio_value=settings.synthetic_portfolio_value, store=_store(settings),
+                                         tot_llm=llm)
+    text = f"run {run_id}\n" + render(items, summary)
+    for it in items:
+        if it.brief_id:
+            text += "\n\n" + _render_brief(db.brief(it.brief_id))
+    print(text)
+    if args.save:
+        _save(settings, f"monitor_{as_of}", {"run": db.run(run_id), "summary": summary,
+              "briefs": [db.brief(i.brief_id) for i in items if i.brief_id]}, text)
+    return 0
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    from .demo import run_demo
+    from .llm import build_llm
+    from .market import Market
+    from .mask import Masker
+    from .tools import screen_ticker
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    sources = _live_sources(settings, pb, as_of)
+    market, edgar = Market(), _edgar_or_none(settings)
+
+    def ask(brief_id: str, text: str) -> bool:
+        if not sys.stdin.isatty():
+            print(f"\n[no terminal: {brief_id} is NOT approved. Run the demo in your own terminal to approve.]")
+            return False
+        return input(f"\nApprove {brief_id}? This writes a paper ticket only. [y/N] ").strip().lower() in ("y", "yes")
+
+    res = run_demo(args.ticker, sources=sources, pb=pb, as_of=as_of, llm=build_llm(settings),
+                   masker=Masker(settings.synthetic_portfolio_value), store=_store(settings),
+                   portfolio_value=settings.synthetic_portfolio_value, approve_fn=ask, render_brief=_render_brief,
+                   screen_fn=None if args.skip_screen else (lambda t: screen_ticker(t, as_of, pb, market, edgar)),
+                   move_pct=args.move_pct)
+    print(f"\n(demo stopped at: {res.stopped_at})")
+    if args.save:
+        _save(settings, f"demo_e2e_{args.ticker.upper()}_{as_of}", {"stopped_at": res.stopped_at, "steps": res.steps},
+              res.text + f"\n\n(demo stopped at: {res.stopped_at})")
+    return 0 if res.stopped_at == "done" else 1
 
 
 def cmd_briefs(args: argparse.Namespace) -> int:
@@ -726,6 +912,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--as-of")
     p.add_argument("--save", action="store_true")
     p.set_defaults(func=cmd_brief)
+
+    p = sub.add_parser("fill", help="PaperBroker: try to fill approved tickets at their limit (synthetic)")
+    p.add_argument("ticket_id", nargs="?")
+    p.add_argument("--as-of")
+    p.set_defaults(func=cmd_fill)
+
+    p = sub.add_parser("positions", help="synthetic paper positions")
+    p.add_argument("--all", action="store_true", help="include closed positions")
+    p.set_defaults(func=cmd_positions)
+
+    p = sub.add_parser("journal", help="trade log (Skill #7) and summary metrics")
+    p.add_argument("--month", help="YYYY-MM (by date opened)")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_journal)
+
+    p = sub.add_parser("iv-snapshot", help="record today's ~30-day ATM IV per ticker (run once a day)")
+    p.add_argument("tickers", nargs="*")
+    p.add_argument("--as-of")
+    p.set_defaults(func=cmd_iv_snapshot)
+
+    p = sub.add_parser("monitor", help="run the 8 management rules on open positions; write exit/roll briefs")
+    p.add_argument("--as-of")
+    p.add_argument("--no-llm", action="store_true", help="rules only; conflicts take the most conservative action")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_monitor)
+
+    p = sub.add_parser("demo", help="end-to-end demo: screen -> brief -> approve -> fill -> monitor (simulated "
+                       "clock) -> exit -> close -> lesson -> journal")
+    p.add_argument("ticker")
+    p.add_argument("--as-of")
+    p.add_argument("--move-pct", type=float, default=0.0, help="simulated stock move after entry (default flat)")
+    p.add_argument("--skip-screen", action="store_true")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_demo)
 
     p = sub.add_parser("tot", help="explore candidate trades as a Tree-of-Thought and print the tree")
     p.add_argument("ticker")

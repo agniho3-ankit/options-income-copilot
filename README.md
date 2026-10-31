@@ -93,6 +93,49 @@ python -m options_copilot.cli brief MSFT --tot           # brief from the ToT pi
 python -m options_copilot.cli tot-compare MSFT --save    # linear ReAct pick vs ToT pick, side by side
 ```
 
+```bash
+# Paper positions, monitoring, journal, end-to-end demo (Phase 4)
+python -m options_copilot.cli fill                       # PaperBroker: fill approved tickets at their limit (synthetic)
+python -m options_copilot.cli positions                  # open synthetic positions (--all for closed too)
+python -m options_copilot.cli monitor --save             # 8 management rules on open positions; exit/roll briefs
+python -m options_copilot.cli iv-snapshot                # record today's ~30-day ATM IV per ticker (once a day)
+python -m options_copilot.cli journal --month 2026-10    # trade log (Skill #7) and summary metrics
+python -m options_copilot.cli demo MSFT --save           # screen -> brief -> approve -> fill -> monitor -> exit -> journal
+```
+
+**PaperBroker.** Approving a brief writes a ticket; `fill` simulates it against the live chain
+with limit-order semantics: an opening ticket fills at its limit credit when the live mid credit
+is at least the limit, and a closing ticket fills at its limit debit when the live mid debit is at
+most the limit. Otherwise it stays working. A roll fills only if both halves would, so it is never
+half done. Expired positions settle at intrinsic value. Nothing is sent anywhere.
+
+**Monitor.** For each open position it refreshes the quote, prices the close with the
+calculators, and runs the 8 rules. Mandatory risk rules (stop loss, 1-sigma move, earnings,
+emergency exits) close the position, and no LLM is asked. Partial actions (buy back one side) are
+escalated to a full close on paper, the stricter choice. When only discretionary rules fire and
+they disagree (say 50% profit versus roll), Qwen picks one of the triggered actions,
+schema-constrained, with a one-line rationale; an invalid answer falls back to the most
+conservative one. A close writes an exit brief. A roll writes one roll brief: the close plus a new
+~45-DTE trade picked by the Tree-of-Thought explorer and verified. Every brief waits for you.
+Rules whose data is missing (for example IV crush before there is IV history) are listed as not
+evaluated.
+
+**IV history.** `iv-snapshot` stores one ~30-day ATM IV per ticker per day. After 20 snapshots
+the IV advisory uses an IV percentile, after 252 a true IV Rank; until then the ATM-IV /
+realized-vol proxy is used, and every brief says which one.
+
+**Journal.** One row per position with the Skill #7 columns. P&L % is of the entry credit (as in
+the playbook example), return on max loss has its own column, and annualized % = P&L % x 365 /
+days held. Closing a position writes a Reflexion lesson.
+
+**End-to-end demo.** Live public data runs through screen, Tree-of-Thought brief, your approval
+at the prompt, and the paper fill. A simulated clock then moves forward one day at a time
+(options re-priced by Black-Scholes from their live mids, stock flat unless `--move-pct`) until a
+rule writes an exit or roll brief, which you approve, and the demo closes the position, writes
+the lesson, and prints the journal. The demo uses its own in-memory database, so it never touches
+your real paper journal, and every simulated step is labelled. Run it in your own terminal: it
+never approves on its own.
+
 ### How the Tree-of-Thought explorer decides (generator -> critic -> controller)
 
 `brief TICKER` (ReAct) builds one trade and commits to it. `tot.py` instead searches a small tree
@@ -168,7 +211,7 @@ Unit tests block network access, and use fake LLM and data clients.
 | 2 | Calculators, verifier, management rules, mask, screener | done |
 | 3 | ReAct agent, approval briefs, Reflexion | done |
 | 4 | Tree-of-Thought explorer (Module 4) | done |
-| 4 | Journal, monitor, end-to-end demo | next |
+| 4 | Journal, PaperBroker, monitor, IV history, end-to-end demo | done |
 
 ## License
 

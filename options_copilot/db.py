@@ -1,5 +1,5 @@
 """SQLite persistence at data/copilot.db: agent runs, masked traces, Tree-of-Thought nodes,
-briefs, and order tickets.
+briefs, order tickets, synthetic paper positions, the trade journal, and IV snapshots.
 
 Trace rows hold only masked content (see mask.py). Briefs and tickets hold the raw trade
 numbers, which are synthetic in this build and never leave data/.
@@ -37,6 +37,21 @@ CREATE TABLE IF NOT EXISTS briefs (
 CREATE TABLE IF NOT EXISTS tickets (
     ticket_id TEXT PRIMARY KEY, brief_id TEXT NOT NULL REFERENCES briefs(brief_id),
     created_at TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS positions (
+    position_id TEXT PRIMARY KEY, ticket_id TEXT, ticker TEXT NOT NULL, status TEXT NOT NULL,
+    opened_on TEXT NOT NULL, closed_on TEXT, payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS journal (
+    position_id TEXT PRIMARY KEY REFERENCES positions(position_id), date_opened TEXT NOT NULL,
+    ticker TEXT NOT NULL, strategy TEXT NOT NULL, short_put REAL, short_call REAL, long_put REAL,
+    long_call REAL, dte INTEGER, entry_credit REAL, entry_max_loss REAL, earnings_note TEXT,
+    date_closed TEXT, close_cost REAL, pnl REAL, pnl_pct REAL, return_on_risk_pct REAL,
+    days_held INTEGER, annualized_pct REAL, exit_rule TEXT, notes TEXT, synthetic INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS iv_history (
+    ticker TEXT NOT NULL, as_of TEXT NOT NULL, atm_iv REAL NOT NULL, expiry TEXT, dte INTEGER,
+    created_at TEXT NOT NULL, PRIMARY KEY (ticker, as_of)
 );
 """
 
@@ -141,6 +156,67 @@ class Database:
                               (ticket_id, brief_id, now(), "approved", json.dumps(payload, default=str)))
         return ticket_id
 
-    def tickets(self) -> list[dict]:
-        rows = self.conn.execute("SELECT * FROM tickets ORDER BY created_at DESC")
+    def tickets(self, status: str | None = None) -> list[dict]:
+        q, args = "SELECT * FROM tickets", ()
+        if status:
+            q, args = q + " WHERE status = ?", (status,)
+        rows = self.conn.execute(q + " ORDER BY created_at, rowid", args)
         return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
+
+    def ticket(self, ticket_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
+        return {**dict(row), "payload": json.loads(row["payload"])} if row else None
+
+    def update_ticket(self, ticket_id: str, status: str, **updates: Any) -> None:
+        t = self.ticket(ticket_id)
+        if t is None:
+            raise ValueError(f"no ticket {ticket_id}")
+        with self.conn:
+            self.conn.execute("UPDATE tickets SET status = ?, payload = ? WHERE ticket_id = ?",
+                              (status, json.dumps({**t["payload"], **updates}, default=str), ticket_id))
+
+    # synthetic paper positions and the trade journal (playbook Skill #7)
+    def save_position(self, position_id: str, ticket_id: str | None, ticker: str, status: str, opened_on: str,
+                      payload: dict, closed_on: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO positions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                              (position_id, ticket_id, ticker, status, opened_on, closed_on,
+                               json.dumps(payload, default=str)))
+
+    def positions(self, status: str | None = None) -> list[dict]:
+        q, args = "SELECT * FROM positions", ()
+        if status:
+            q, args = q + " WHERE status = ?", (status,)
+        return [{**dict(r), "payload": json.loads(r["payload"])} for r in self.conn.execute(q + " ORDER BY opened_on", args)]
+
+    def position(self, position_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM positions WHERE position_id = ?", (position_id,)).fetchone()
+        return {**dict(row), "payload": json.loads(row["payload"])} if row else None
+
+    JOURNAL_COLS = ("position_id", "date_opened", "ticker", "strategy", "short_put", "short_call", "long_put",
+                    "long_call", "dte", "entry_credit", "entry_max_loss", "earnings_note", "date_closed",
+                    "close_cost", "pnl", "pnl_pct", "return_on_risk_pct", "days_held", "annualized_pct",
+                    "exit_rule", "notes", "synthetic")
+
+    def save_journal(self, row: dict) -> None:
+        cols = [c for c in self.JOURNAL_COLS if c in row]
+        with self.conn:
+            self.conn.execute(f"INSERT OR REPLACE INTO journal ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                              [row[c] for c in cols])
+
+    def journal(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM journal ORDER BY date_opened, position_id")]
+
+    # daily IV snapshots (one per ticker per day; a re-run the same day replaces it)
+    def add_iv_snapshot(self, ticker: str, as_of: str, atm_iv: float, expiry: str | None, dte: int | None) -> None:
+        with self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO iv_history VALUES (?, ?, ?, ?, ?, ?)",
+                              (ticker, as_of, atm_iv, expiry, dte, now()))
+
+    def iv_history(self, ticker: str, before: str | None = None) -> list[tuple[str, float]]:
+        """(as_of, atm_iv) oldest first, optionally only days strictly before `before`."""
+        q, args = "SELECT as_of, atm_iv FROM iv_history WHERE ticker = ?", [ticker]
+        if before:
+            q += " AND as_of < ?"
+            args.append(before)
+        return [(r[0], r[1]) for r in self.conn.execute(q + " ORDER BY as_of", args)]

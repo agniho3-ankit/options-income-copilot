@@ -101,6 +101,7 @@ class ToolBox:
     proposals: dict[str, Proposal] = field(default_factory=dict)
     submissions: list[tuple[str, VerifierResult]] = field(default_factory=list)
     accepted: tuple[str, VerifierResult] | None = None
+    iv_history: tuple[float, ...] = ()  # this ticker's daily ATM IV snapshots, oldest first
     _chains: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -281,16 +282,14 @@ class ToolBox:
             max_vol_oi_ratio=self.flow, **self._iv_rank())
 
     def _iv_rank(self) -> dict:
-        """IV-rank proxy (ATM IV / realized vol) until Phase 4 builds IV history."""
-        from .indicators import iv_rank_proxy
+        """IV rank, IV percentile, or the ATM IV / realized-vol proxy (see indicators)."""
+        from .indicators import atm_iv, iv_rank_from_history
         d = self._data()
-        spot = d.profile.price
-        near = sorted((q for q in self.chain_quotes if q.iv), key=lambda q: abs(q.strike - spot))[:4]
-        if not near or not d.rv30:
+        current = atm_iv(self.chain_quotes, d.profile.price)
+        if current is None:
             return {}
-        atm = sum(q.iv for q in near) / len(near)
-        return {"iv_rank": iv_rank_proxy(atm, d.rv30),
-                "iv_rank_label": f"proxy: ATM IV {atm:.0%} / 30d RV {d.rv30:.0%}, no IV history yet"}
+        got = iv_rank_from_history(current, list(self.iv_history), d.rv30, self.pb)
+        return {} if got is None else {"iv_rank": got[0], "iv_rank_label": got[1]}
 
     def submit_trade(self, proposal_id: str, rationale: str = "") -> dict:
         prop = self.proposals.get(str(proposal_id).strip().upper())
