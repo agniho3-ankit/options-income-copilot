@@ -174,6 +174,7 @@ def test_llm_critic_in_search_only_lowers_or_vetoes(pb):
     vetoed = [n for n in result.tree.nodes if n.prune_reason.startswith("critic veto")]
     assert len(vetoed) == 1 and vetoed[0].status is Status.PRUNED
     assert result.selected is not None and result.selected.id != vetoed[0].id
+    assert result.stats["critic_runs"] == 1
 
 
 # --- generator --------------------------------------------------------------------------------
@@ -275,6 +276,9 @@ def test_no_expiry_before_earnings_gives_no_trade(pb):
     result, _, _ = run(pb, EarningsSoon())
     assert result.outcome == NO_TRADE and result.stats["builds"] == 0
     assert any("before earnings" in r for r in result.reasons)
+    # With an LLM attached but no leaves, the critic never runs and is not counted.
+    result, _, _ = run(pb, EarningsSoon(), llm=RoutingLLM(critic=lambda u: {"reviews": []}))
+    assert result.outcome == NO_TRADE and result.stats["critic_runs"] == 0
 
 
 @pytest.mark.parametrize("verdict", ["BLOCK", "INSUFFICIENT_EVIDENCE"])

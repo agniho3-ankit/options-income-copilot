@@ -155,12 +155,14 @@ def enforce(raw: dict[str, Any] | None, by_id: dict[str, RetrievedChunk],
 
 
 def landmine_check(ticker: str, trade_context: str, use_retrieval: bool = True, *, store: Store | None,
-                   llm: LLMClient, as_of: date | None = None) -> dict[str, Any]:
-    """Return {verdict, reasons, citations, ...} for one ticker and planned trade."""
+                   llm: LLMClient, as_of: date | None = None, query: str | None = None) -> dict[str, Any]:
+    """Return {verdict, reasons, citations, ...} for one ticker and planned trade. `query`
+    overrides the retrieval query (the multi-agent Researcher's one rewrite); the hard filters,
+    coverage check and verdict rules are the same either way."""
     ticker = ticker.upper()
     as_of = as_of or date.today()
-    query = LANDMINE_QUERY.format(ticker=ticker, context=trade_context)
-    result: dict[str, Any] = {"ticker": ticker, "as_of": as_of.isoformat(), "trade_context": trade_context,
+    query = " ".join(query.split())[:400] if query else LANDMINE_QUERY.format(ticker=ticker, context=trade_context)
+    result: dict[str, Any] = {"ticker": ticker, "as_of": as_of.isoformat(), "trade_context": trade_context, "query": query,
                               "use_retrieval": use_retrieval, "model": llm.name}
 
     retrieval: RetrievalResult | None = None

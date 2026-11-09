@@ -841,9 +841,193 @@ def cmd_trace(args: argparse.Namespace) -> int:
         print(f"no run {args.run_id}", file=sys.stderr)
         return 1
     print(json.dumps(run, indent=2))
+    spans = db.spans(args.run_id)
+    if spans and not args.full:
+        print(_render_spans(spans))
+        print("(use --full for every prompt, reply and tool call)")
+        return 0
     for row in db.trace(args.run_id):
         body = row["content"] if len(row["content"]) < 600 or args.full else row["content"][:600] + " ..."
         print(f"[{row['seq']:>3}] {row['role']:<9}{row['name'] or '':<18}{body}")
+    return 0
+
+
+def _render_spans(spans: list[dict]) -> str:
+    """Indented span timeline: session > supervisor > the agent it routed to."""
+    from datetime import datetime
+    kids: dict[str | None, list[dict]] = {}
+    for s in spans:
+        kids.setdefault(s["parent_id"], []).append(s)
+    t0 = next((datetime.fromisoformat(s["started_at"]) for s in spans if s["started_at"]), None)
+    lines = [f"{'offset':>8} {'ms':>7}  span"]
+
+    def walk(s: dict, depth: int) -> None:
+        off = "" if not s["started_at"] or t0 is None else \
+            f"{(datetime.fromisoformat(s['started_at']) - t0).total_seconds():7.1f}s"
+        out = s.get("output_summary") or ""
+        lines.append(f"{off:>8} {s['duration_ms'] or 0:>7}  {'  ' * depth}{s['agent']:<14}[{s['pattern'] or '-'}]"
+                     f"  llm {s['llm_calls'] or 0}  {out[:90]}" + (f"  ERROR {s['error']}" if s.get("error") else ""))
+        for k in kids.get(s["span_id"], []):
+            walk(k, depth + 1)
+
+    for root in kids.get(None, []):
+        walk(root, 0)
+    totals: dict[str, list[int]] = {}
+    for s in spans:
+        if s["agent"] != "session":
+            t = totals.setdefault(s["agent"], [0, 0, 0])
+            t[0] += 1
+            t[1] += s["duration_ms"] or 0
+            t[2] += s["llm_calls"] or 0
+    lines.append("per agent: " + "; ".join(f"{a} x{n} {ms / 1000:.1f}s llm {c}" for a, (n, ms, c) in totals.items()))
+    return "\n".join(lines)
+
+
+def cmd_ma(args: argparse.Namespace) -> int:
+    from .llm import build_llm
+    from .mask import Masker
+    from .multi_agent.runner import run_multi_agent
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db = _db(settings)
+    r = run_multi_agent(args.ticker, sources=_live_sources(settings, pb, as_of), pb=pb, as_of=as_of,
+                        llm=None if args.no_llm else build_llm(settings, num_ctx=16384), db=db,
+                        masker=Masker(settings.synthetic_portfolio_value),
+                        portfolio_value=settings.synthetic_portfolio_value, store=_store(settings),
+                        open_max_losses=_open_losses(db), use_agents=not args.no_agents,
+                        graph_out=settings.repo_root / "demo_outputs" / "agent_graph.md")
+    text = _render_ma(r, db)
+    print(text)
+    if args.save:
+        _save(settings, f"ma_{args.ticker.upper()}_{as_of}", {"run": db.run(r.run_id), "state": r.state,
+              "spans": db.spans(r.run_id), "brief": db.brief(r.state["brief_id"]) if r.state.get("brief_id") else None},
+              text)
+    return 0
+
+
+def _render_ma(r, db) -> str:
+    s = r.state
+    research = s.get("research") or {}
+    lines = [f"== Multi-agent run {r.run_id} ({s['ticker']} as of {s['as_of']}): {r.outcome} ==",
+             f"route: {' -> '.join(s.get('route_log', []))}",
+             f"researcher: filings {research.get('verdict')}, rewrites {research.get('rewrites', 0)}; attempts "
+             + "; ".join(f"{a['verdict']} (coverage {'ok' if a['coverage_ok'] else 'FAILED'}, relevant "
+                         f"{a['relevant']})" for a in research.get("attempts", [])),
+             f"critic rounds {s.get('critic_rounds', 0)}; LLM calls {r.llm_calls}; builds {r.builds}; MCP calls "
+             f"{r.mcp_calls}; latency {r.latency_ms / 1000:.1f}s; agents {', '.join(r.agents)}; messages "
+             f"{len(s.get('messages', []))}"]
+    if s.get("chosen"):
+        lines.append(f"chosen: {s['chosen']['path']} (score {s['chosen']['score']}), gate verdict "
+                     f"{(s.get('verifier') or {}).get('verdict')}")
+    for why in s.get("reasons", []):
+        lines.append(f"reason: {why}")
+    for e in s.get("errors", [])[:6]:
+        lines.append(f"note: {e}")
+    lines += ["", "spans:", _render_spans(db.spans(r.run_id))]
+    if s.get("brief_id"):
+        lines += ["", _render_brief(db.brief(s["brief_id"])),
+                  f"\nApprove with: copilot approve {s['brief_id']}   or reject with: copilot reject {s['brief_id']} "
+                  "--reason \"...\""]
+    if s.get("lesson"):
+        lines.append(f"lesson (learner): {s['lesson']}")
+    return "\n".join(lines)
+
+
+def cmd_ma_compare(args: argparse.Namespace) -> int:
+    import time
+
+    from .agent_tools import ToolBox
+    from .llm import build_llm
+    from .mask import Masker
+    from .multi_agent.runner import run_multi_agent
+    from .react import run_agent
+    from .tot import explore, score_proposal
+
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db = _db(settings)
+    masker = Masker(settings.synthetic_portfolio_value)
+    shared = _live_box(settings, pb, as_of, args.ticker, cached=True)
+    _prewarm(shared, pb)   # one landmine check and every eligible chain, shared by all three planners
+    fresh = lambda: ToolBox(shared.ticker, shared.sources, pb, as_of, settings.synthetic_portfolio_value,  # noqa: E731
+                            open_max_losses=shared.open_max_losses, iv_history=shared.iv_history)
+
+    def pick(box) -> dict:
+        if box.accepted is None:
+            return {"trade": None, "verdict": None, "score": None}
+        pid, res = box.accepted
+        prop = box.proposals[pid]
+        legs = " ".join(f"{g.side.value[0]}{g.option_type.value[0].upper()}{g.strike:g}" for g in prop.proposal.legs)
+        return {"trade": f"{prop.proposal.strategy.value} {prop.proposal.expiry} {legs}", "verdict": res.verdict.value,
+                "score": score_proposal(box, pb, pid)[0]}
+
+    rows = {}
+    rbox = fresh()
+    t0 = time.monotonic()
+    react = run_agent(f"Plan one entry trade on {rbox.ticker} as of {as_of.isoformat()}.", rbox,
+                      build_llm(settings, num_ctx=16384), db, masker, pb, max_steps=args.max_steps)
+    rows["ReAct (single)"] = {"run_id": react.run_id, "outcome": react.outcome, "llm_calls": react.stats["steps"],
+                              "latency_ms": int((time.monotonic() - t0) * 1000), "agents": 1,
+                              "messages": len(db.trace(react.run_id)), "critic_rounds": 0, "rewrites": 0,
+                              "builds": len(rbox.proposals), **pick(rbox)}
+    tbox = fresh()
+    tot = explore(tbox, pb, build_llm(settings), db, masker)
+    rows["ToT (single)"] = {"run_id": tot.run_id, "outcome": tot.outcome, "llm_calls": tot.stats["llm_calls"],
+                            "latency_ms": tot.stats["latency_ms"], "agents": 1, "messages": len(db.trace(tot.run_id)),
+                            "critic_rounds": tot.stats.get("critic_runs", 0),
+                            "rewrites": 0, "builds": tot.stats["builds"], **pick(tbox)}
+    ma = run_multi_agent(shared.ticker, sources=shared.sources, pb=pb, as_of=as_of,
+                         llm=build_llm(settings, num_ctx=16384), db=db, masker=masker,
+                         portfolio_value=settings.synthetic_portfolio_value, store=_store(settings),
+                         open_max_losses=shared.open_max_losses,
+                         graph_out=settings.repo_root / "demo_outputs" / "agent_graph.md")
+    from .mcp_server import MCPContext  # noqa: F401 - the MA box lives in the run's MCP context
+    mbox_pick = {"trade": None, "verdict": None, "score": None}
+    if ma.state.get("chosen"):
+        v = ma.state["verifier"]
+        legs = " ".join(f"{g['side'][0]}{g['type'][0].upper()}{g['strike']:g}" for g in v["legs"])
+        mbox_pick = {"trade": f"{v['strategy']} {v['expiry']} {legs}", "verdict": v["verdict"],
+                     "score": ma.state["chosen"]["score"]}
+    rows["Multi-agent"] = {"run_id": ma.run_id, "outcome": ma.outcome, "llm_calls": ma.llm_calls,
+                           "latency_ms": ma.latency_ms, "agents": len([a for a in ma.agents if a != "supervisor"]),
+                           "messages": len(ma.state.get("messages", [])), "critic_rounds": ma.state.get("critic_rounds", 0),
+                           "rewrites": (ma.state.get("research") or {}).get("rewrites", 0), "builds": ma.builds,
+                           **mbox_pick}
+    fields = [("outcome", "outcome"), ("chosen trade", "trade"), ("verifier", "verdict"), ("score", "score"),
+              ("LLM calls", "llm_calls"), ("latency (s)", "latency_ms"), ("builds", "builds"), ("agents", "agents"),
+              ("messages", "messages"), ("critic rounds", "critic_rounds"), ("query rewrites", "rewrites")]
+    fmt = lambda k, v: "-" if v is None else f"{v / 1000:.1f}" if k == "latency_ms" else str(v)  # noqa: E731
+    names = list(rows)
+    lines = [f"== Single agent vs multi-agent: {shared.ticker} as of {as_of} ==",
+             f"shared inputs: prefetched quotes and chains, one default filings check "
+             f"({shared.landmine_result['verdict']}); the multi-agent researcher may add one rewritten query.",
+             "score = deterministic tot.weights score of the chosen trade (multi-agent: after its critic).",
+             f"{'':<16}" + "".join(f"{n:<46}" for n in names)]
+    for label, key in fields:
+        lines.append((f"{label:<16}" + "".join(f"{fmt(key, rows[n].get(key)):<46}" for n in names)).rstrip())
+    lines += ["", "multi-agent spans:", _render_spans(db.spans(ma.run_id))]
+    text = "\n".join(lines)
+    print(text)
+    if args.save:
+        _save(settings, f"ma_compare_{shared.ticker}_{as_of}", {"rows": rows, "ma_state": ma.state,
+              "ma_spans": db.spans(ma.run_id)}, text)
+    return 0
+
+
+def cmd_mcp_serve(args: argparse.Namespace) -> int:
+    from .mcp_server import MCPContext, serve_stdio
+    from .multi_agent import privacy
+
+    settings = load_settings()
+    privacy.configure()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    db = _db(settings)
+    serve_stdio(MCPContext(_live_sources(settings, pb, as_of), pb, as_of, settings.synthetic_portfolio_value, db,
+                           _open_losses(db)))
     return 0
 
 
@@ -948,6 +1132,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-screen", action="store_true")
     p.add_argument("--save", action="store_true")
     p.set_defaults(func=cmd_demo)
+
+    p = sub.add_parser("ma", help="multi-agent entry workflow (LangGraph supervisor, CrewAI agents, MCP tools)")
+    p.add_argument("ticker")
+    p.add_argument("--as-of")
+    p.add_argument("--no-agents", action="store_true", help="no CrewAI agents: deterministic strategist, no critic")
+    p.add_argument("--no-llm", action="store_true", help="rules only (implies --no-agents)")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_ma)
+
+    p = sub.add_parser("ma-compare", help="single ReAct vs ToT vs multi-agent graph on the same prefetched data")
+    p.add_argument("ticker")
+    p.add_argument("--as-of")
+    p.add_argument("--max-steps", type=int, default=14)
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_ma_compare)
+
+    p = sub.add_parser("mcp-serve", help="serve the deterministic tools over MCP (stdio, local only)")
+    p.add_argument("--as-of")
+    p.set_defaults(func=cmd_mcp_serve)
 
     p = sub.add_parser("tot", help="explore candidate trades as a Tree-of-Thought and print the tree")
     p.add_argument("ticker")

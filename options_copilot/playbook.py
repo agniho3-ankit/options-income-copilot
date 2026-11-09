@@ -136,6 +136,13 @@ SPEC: dict[str, Rule] = {
     "tot.earnings_clearance_full_scale_days": _days(1),
     "tot.liquidity_oi_multiple": Rule(NUM, 0.1, 100),
     "tot.exploration_slots": Rule(int, 0, 9),
+    "multi_agent.max_critic_rounds": Rule(int, 0, 5),
+    "multi_agent.max_llm_calls": Rule(int, 1, 500),
+    "multi_agent.max_builds": Rule(int, 1, 500),
+    "multi_agent.max_wall_seconds": Rule(int, 10, 7200),
+    "multi_agent.min_relevant_chunks": Rule(int, 1, 20),
+    "multi_agent.max_query_rewrites": Rule(int, 0, 1),
+    "multi_agent.agent_max_iter": Rule(int, 1, 10),
 }
 
 

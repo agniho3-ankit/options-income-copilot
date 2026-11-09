@@ -173,6 +173,106 @@ CAUTION.
 The first `ingest` or `seed-lessons` run downloads Chroma's built-in MiniLM embedding model
 (about 80 MB, cached under your home directory). `check` and `compare` need Ollama running.
 
+## Multi-agent workflow (Phase 5, Module 5)
+
+```bash
+python -m options_copilot.cli ma MSFT --save          # one run of the agent team; writes a pending brief
+python -m options_copilot.cli ma-compare MSFT --save  # single ReAct vs ToT vs the team, same prefetched data
+python -m options_copilot.cli trace RUN_ID            # span timeline per agent (--full for every message)
+python -m options_copilot.cli mcp-serve               # the tools over MCP, stdio only, for outside clients
+```
+
+The single-agent entry path (ReAct, then ToT, then brief) becomes a team under a **supervisor**.
+`brief`, `brief --tot` and `tot-compare` are unchanged.
+
+```
+START -> supervisor -> researcher -> supervisor -> strategist <-> risk_critic (through the supervisor)
+      -> supervisor -> verifier_gate -> brief_writer -> learner (only on NO_TRADE) -> END
+```
+
+| Role | Built with | What it may do |
+|---|---|---|
+| Supervisor | LangGraph conditional edges | Routes from state with a pure function. No LLM picks a path. |
+| Researcher | LangGraph node | Landmine check through MCP, an LLM relevance grader, and at most one query rewrite. |
+| Strategist | CrewAI agent | Proposes ToT candidates inside the playbook bands. Read-only tools; never a number. |
+| Risk Critic | CrewAI agent | Reviews verified candidates: keep, lower, or veto with an allowed citation. Python applies it and can only lower. |
+| Verifier gate | Deterministic tool via MCP | Re-verifies the best candidate. Final authority. |
+| Brief writer | LLM node | Prose only; sentences with digits are dropped. Every number comes from the tools. |
+| Learner | Reflexion | A lesson when the run ends with no trade. |
+
+**Supervisor pattern.** Money is at stake, so predictability beats flexibility: one hub routes
+every step from typed shared state (`multi_agent/state.py`). BLOCK or INSUFFICIENT_EVIDENCE from
+the researcher ends the run with an escalation, and no strategist runs. An exhausted budget (LLM
+calls, builds, critic rounds, wall clock, all in `playbook.yaml` `multi_agent:`) goes straight to
+the verifier gate. The only edge into `brief_writer` comes from `verifier_gate`; a test checks
+this on the compiled graph. The graph is exported as Mermaid to `demo_outputs/agent_graph.md`.
+
+**Communication patterns** (each recorded on the spans and in the state's message log):
+- *One-way pipeline:* supervisor -> researcher -> strategist, gate -> brief writer -> learner.
+- *Two-way:* strategist <-> risk critic, at most `max_critic_rounds` (default 2). The critic's
+  reviews go back to the strategist as feedback (wrapped as data), and it proposes new deltas
+  under the expiries the critic hit.
+- *Brainstorming:* the Tree-of-Thought branching inside the strategist.
+
+**Researcher's RAG loop.** The grader marks which retrieved excerpts are about a material event.
+If fewer than `min_relevant_chunks` are relevant (or nothing was retrieved), the query is rewritten
+once and retrieval runs again. The coverage guard is unchanged. A rewrite can cure a coverage miss
+(INSUFFICIENT_EVIDENCE only because too little was retrieved), but a BLOCK or CAUTION from either
+query always stands, and the verifier sees every citation and event date from both queries.
+
+**MCP.** `options_copilot/mcp_server.py` exposes `get_quote`, `get_option_chain`,
+`get_earnings_date`, `search_filings`, `search_lessons`, `build_and_verify`, and `score_trade`, plus
+the resources `tot://{run_id}` and `trace://{run_id}`. During a run the graph and the agents call it
+through an in-memory MCP client session on the same cached data; `mcp-serve` exposes the same
+server over stdio. There is no network listener and no token. Tests check that every tool returns
+exactly what the direct function returns.
+
+**Observability.** Each run is a session and each node execution is a span in SQLite (`spans`):
+parent span, agent, start and end, duration, LLM calls, masked input and output summaries, error,
+and the communication pattern. Every LLM prompt and reply, including the CrewAI agents', goes to
+the masked trace. `trace RUN_ID` prints the timeline. No cloud tracing: CrewAI telemetry and
+tracing, OpenTelemetry exporters, and LangSmith/LangChain tracing are forced off at startup
+(`multi_agent/privacy.py`, tested).
+
+**Local LLM only.** Every CrewAI agent runs on `CopilotLLM`, a small adapter over the same Ollama
+client (`qwen3:8b`), with the Claude fallback only if Ollama fails and a key is set. Building an
+agent with any other LLM raises, and the OpenAI endpoint is pointed at a closed local port so a
+stray default call fails on this machine.
+
+**What stays single-path and deterministic, and why.** Monitoring, the calculators, the verifier,
+and the scorer are tools, not agents. Their answers must be the same every time for the same
+inputs, they are what the safety rules rest on, and none of them improves with debate: a second
+agent cannot make a Black-Scholes price or a stop-loss rule more correct, only less predictable.
+Monitoring decisions are already rule-first, and the LLM only resolves genuine conflicts.
+
+**Fine-tuning (LoRA): considered, not built.** The rules are config the owner edits, the math is
+deterministic Python, and fresh facts come from RAG over filings. A fine-tuned model would add
+training data, evaluation and safety-review cost, and it would not fix any failure we have seen:
+the failures so far were search breadth, data coverage and number hallucination in prose, which
+the beam, the coverage guard and code-filled numbers already address.
+
+**Side-by-side runs** (`ma-compare TICKER --save`, live public data, US market hours, qwen3:8b
+on this laptop; score is the deterministic `tot.weights` score after any critic):
+
+| Ticker | ReAct (single) | ToT (single) | Multi-agent |
+|---|---|---|---|
+| MSFT | no_trade, 14 LLM calls, 128 s | SELECTED call spread 580/595, 0.5457, 9 calls, 127 s | same trade, 0.382 after 2 critic rounds, 1 query rewrite, 16 calls, 247 s |
+| META | budget exhausted, 14 calls, 123 s | SELECTED call spread 695/715, 0.7235, 9 calls, 172 s | SELECTED a safer call spread 710/730, 0.5219, 1 critic round, 14 calls, 312 s |
+| NVDA | no_trade, 14 calls, 195 s | NO_TRADE (no expiry inside the DTE window before earnings), 1 call, 19 s | NO_TRADE, same reason, 3 calls, 46 s, lesson written |
+
+**Where the multi-agent version helped.** On META the critic sent three expiries back and the team
+chose a further out-of-the-money spread than single ToT: a more conservative trade, not just a
+lower score. The researcher's rewrite (MSFT) adds a second retrieval at the cost of one LLM call.
+Every hand-off is a span, so `trace RUN_ID` shows who decided what.
+
+**Where it did not help.** It is about 1.8 to 2 times slower than single ToT and never safer than
+the gate: the safety guarantees come from the deterministic verifier either way, and on NVDA the
+earnings rule stopped all three modes. On MSFT it picked the same trade as single ToT. With
+qwen3:8b the CrewAI Strategist first echoed the JSON schema instead of answering (every expansion
+fell back to the enumerator) until the task showed an example object instead. The Risk Critic's
+citations can be loose (it cited a check that had passed); that is harmless only because Python
+lets it lower, never raise.
+
 ### How the landmine check decides
 
 1. Retrieval is hard-filtered to the ticker and the 90 days up to `--as-of`, fetches 20
@@ -216,6 +316,7 @@ Unit tests block network access, and use fake LLM and data clients.
 | 3 | ReAct agent, approval briefs, Reflexion | done |
 | 4 | Tree-of-Thought explorer (Module 4) | done |
 | 4 | Journal, PaperBroker, monitor, IV history, end-to-end demo | done |
+| 5 | Multi-agent workflow: LangGraph supervisor, CrewAI roles, MCP server, spans | done |
 
 ## License
 

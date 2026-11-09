@@ -146,8 +146,10 @@ class CachedSources:
     def chain(self, ticker, expiry):
         return self._get(("chain", ticker, expiry), lambda: self.inner.chain(ticker, expiry))
 
-    def landmine(self, ticker, context):
-        return self._get(("lm", ticker), lambda: self.inner.landmine(ticker, context))
+    def landmine(self, ticker, context, query=None):
+        if query is None:
+            return self._get(("lm", ticker), lambda: self.inner.landmine(ticker, context))
+        return self._get(("lm", ticker, query), lambda: self.inner.landmine(ticker, context, query=query))
 
     def lessons(self, ticker, query):
         return self.inner.lessons(ticker, query)
@@ -168,9 +170,9 @@ class LiveSources:
     def chain(self, ticker: str, expiry: date):
         return self.market.chain(ticker, expiry)
 
-    def landmine(self, ticker: str, context: str) -> dict:
+    def landmine(self, ticker: str, context: str, query: str | None = None) -> dict:
         from .agent import landmine_check
-        return landmine_check(ticker, context, store=self.store, llm=self.llm, as_of=self.as_of)
+        return landmine_check(ticker, context, store=self.store, llm=self.llm, as_of=self.as_of, query=query)
 
     def lessons(self, ticker: str, query: str):
         return self.store.search_lessons(ticker, query)

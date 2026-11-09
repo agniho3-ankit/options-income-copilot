@@ -28,7 +28,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 from .agent_tools import ToolBox
 from .calculators import BuildError, CalcError, delta_band
@@ -293,8 +293,16 @@ def _parse_json(text: str) -> Any:
 
 class Explorer:
     def __init__(self, box: ToolBox, pb: Playbook, llm: LLMClient | None, db: Database, masker: Masker,
-                 *, use_critic: bool | None = None, exhaustive: bool = False):
+                 *, use_critic: bool | None = None, exhaustive: bool = False,
+                 generate: Callable[[str, dict, dict], Any] | None = None,
+                 build: Callable[[Strategy, date, float], tuple[str, VerifierResult]] | None = None):
+        """`generate(system, user, schema) -> JSON` replaces the direct LLM generator call (the
+        multi-agent Strategist plugs in here); `build` replaces the leaf build -> verify call (the
+        multi-agent graph routes it through the MCP server). Both default to the single-agent path."""
         self.box, self.pb, self.llm, self.db, self.masker = box, pb, llm, db, masker
+        self.generate, self.build = generate, build or box.build_and_verify
+        self.feedback = ""
+        self._tried: set[float] = set()
         self.cfg = dict(pb["tot"])
         self.exhaustive = exhaustive
         if exhaustive:  # offline check: every strategy x expiry x 5 deltas, deterministic, no beam cut
@@ -305,7 +313,7 @@ class Explorer:
         self.results: dict[str, tuple[str, VerifierResult]] = {}
         self.stats = {"nodes": 0, "pruned": 0, "builds": 0, "llm_calls": 0, "llm_errors": 0,
                       "candidates_rejected": 0, "fallback_expansions": 0, "eval_tokens": 0,
-                      "critic_notes": [], "latency_ms": 0, "stopped_by": None}
+                      "critic_notes": [], "critic_runs": 0, "latency_ms": 0, "stopped_by": None}
         self.run_id = ""
 
     # node bookkeeping
@@ -346,7 +354,27 @@ class Explorer:
         q.update(self.box.get_earnings_date())
         lm = self.box.landmine_result or {}
         q["filings_verdict"] = lm.get("verdict")
+        if self.feedback:
+            q["critic_feedback"] = f"<<<DATA>>>{self.feedback}<<<END DATA>>>"
         return q
+
+    def _generate_via_hook(self, system: str, user: dict, schema: dict) -> Any:
+        """Same budget, masking and trace as _chat, but the reply comes from the hook."""
+        if self.stats["llm_calls"] >= self.cfg["max_llm_calls"]:
+            raise BudgetExhausted(f"LLM call budget ({self.cfg['max_llm_calls']}) used up")
+        self.stats["llm_calls"] += 1
+        payload = self.masker.value(user)
+        self._trace("user", payload, "generator")
+        t0 = time.monotonic()
+        try:
+            raw = self.generate(system, payload, schema)
+        except Exception as exc:  # noqa: BLE001 - any agent failure falls back to the enumerator
+            self.stats["llm_errors"] += 1
+            self._trace("error", str(exc)[:300], "generator")
+            raise ValueError(f"generator agent failed: {exc}") from None
+        self._trace("assistant", raw if isinstance(raw, str) else json.dumps(raw, default=str), "generator",
+                    duration_ms=int((time.monotonic() - t0) * 1000))
+        return _parse_json(raw) if isinstance(raw, str) else raw
 
     def _options(self, node: Node) -> tuple[list[Any], str]:
         """(allowed values for the child level, why the list is empty)."""
@@ -403,6 +431,9 @@ class Explorer:
         if node.depth == 1:
             return [(e, f"fallback: {(date.fromisoformat(e) - self.box.as_of).days} DTE, nearest the target first")
                     for e in allowed[:k]]
+        if self._tried:   # a revision: offer untried deltas from a finer grid
+            fresh = [v for v in fallback_deltas(*allowed, 2 * k + 1) if v not in self._tried][:k]
+            return [(v, "fallback: an untried delta inside the band (revision)") for v in fresh]
         return [(v, "fallback: evenly spaced inside the delta band")
                 for v in fallback_deltas(*allowed, 5 if self.exhaustive else k)]
 
@@ -423,13 +454,16 @@ class Explorer:
         level = LEVELS[node.depth + 1]
         cands: list[tuple[Any, str]] = []
         source, note = "fallback", "no LLM"
-        if self.llm is not None:
+        if self.llm is not None or self.generate is not None:
             user = {"ticker": self.box.ticker, "decide": level, "path_so_far": asdict(node.spec),
                     "allowed": allowed if level != "target_delta" else {"min": allowed[0], "max": allowed[1]},
                     "max_candidates": self.cfg["children_per_node"], "facts": self._facts()}
             try:
-                raw = self._chat("generator", GEN_SYSTEM.format(k=self.cfg["children_per_node"], level=level), user,
-                                 self._schema(node, allowed))
+                system = GEN_SYSTEM.format(k=self.cfg["children_per_node"], level=level)
+                if self.generate is not None:
+                    raw = self._generate_via_hook(system, user, self._schema(node, allowed))
+                else:
+                    raw = self._chat("generator", system, user, self._schema(node, allowed))
                 cands, rejected = self._validate(node, raw, allowed)
                 self.stats["candidates_rejected"] += len(rejected)
                 if rejected:
@@ -473,7 +507,7 @@ class Explorer:
         s = node.spec
         t0 = time.monotonic()
         try:
-            pid, result = self.box.build_and_verify(Strategy(s.strategy), date.fromisoformat(s.expiry), s.target_delta)
+            pid, result = self.build(Strategy(s.strategy), date.fromisoformat(s.expiry), s.target_delta)
         except (BuildError, CalcError) as exc:
             node.prune(f"build: {exc}")
             node.detail["build_ms"] = int((time.monotonic() - t0) * 1000)
@@ -568,12 +602,16 @@ class Explorer:
         except (LLMError, ValueError) as exc:
             self.stats["critic_notes"].append(f"critic failed, scores unchanged: {str(exc)[:120]}")
             return
+        self.stats["critic_runs"] += 1
         notes = apply_critique({n.id: n for n in leaves}, raw.get("reviews") if isinstance(raw, dict) else None,
                                dict(self.cfg["critic_penalty"]), cites, self.masker)
         self.stats["critic_notes"] += notes
 
-    def run(self) -> ToTResult:
-        t0 = time.monotonic()
+    # The search runs as begin() -> search() -> finish(). run() chains them; the multi-agent graph
+    # drives the same steps from its nodes and adds revise() rounds between search and finish.
+    def begin(self) -> tuple[Node, dict, bool]:
+        """Start the run and the root. Returns (root, landmine result, stopped)."""
+        self._t0 = time.monotonic()
         self.run_id = self.db.start_run("tot", self.box.ticker, self.llm.name if self.llm else "deterministic",
                                         self.pb.sha256)
         root = self._new(None, Spec(), "", "root", 0)
@@ -582,37 +620,71 @@ class Explorer:
         root.detail["landmine"] = lm.get("verdict")
         self._trace("tool", {"verdict": lm.get("verdict"), "citations": lm.get("citations", []),
                              "event_dates": lm.get("event_dates", [])}, "search_filings")
-        outcome, reasons = NO_TRADE, []
+        self._outcome, self._reasons = NO_TRADE, []
         if lm.get("verdict") in (Verdict.BLOCK.value, Verdict.INSUFFICIENT_EVIDENCE.value):
             root.prune(f"landmine {lm['verdict']}: " + "; ".join(lm.get("reasons", []))[:300])
-            outcome, reasons = lm["verdict"], [root.prune_reason]
-        else:
-            self.box.search_lessons()
-            try:
-                frontier = [root]
-                for depth in range(1, self.cfg["max_depth"] + 1):
-                    children = [c for n in frontier for c in self.expand(n)]
-                    if depth == 3:
-                        order = sorted(children, key=lambda c: (c.rank, int(c.id[1:])))
-                        for c in order:
-                            self.evaluate(c)
-                        self.critic([c for c in children if c.status is Status.LEAF])
-                    frontier = self._beam(children, depth)
-                    if not frontier:
-                        break
-                if self.cfg["max_depth"] < 3:
-                    for n in frontier:
-                        n.prune(f"depth limit {self.cfg['max_depth']} reached before a full trade spec")
-            except BudgetExhausted as exc:
-                self.stats["stopped_by"] = str(exc)
-                for n in self.tree.nodes:
-                    if n.status is Status.OPEN and n.depth > 0:
-                        n.prune(f"search stopped: {exc}")
-                leaves = [n for n in self.tree.nodes if n.status is Status.LEAF]
-                self.critic(leaves)
-                self._beam(leaves, 3)
+            self._outcome, self._reasons = lm["verdict"], [root.prune_reason]
+            return root, lm, True
+        self.box.search_lessons()
+        return root, lm, False
+
+    def search(self, root: Node) -> None:
+        """Expand depth 1..max_depth with the beam; leaves are built, verified and scored."""
+        try:
+            frontier = [root]
+            for depth in range(1, self.cfg["max_depth"] + 1):
+                children = [c for n in frontier for c in self.expand(n)]
+                if depth == 3:
+                    order = sorted(children, key=lambda c: (c.rank, int(c.id[1:])))
+                    for c in order:
+                        self.evaluate(c)
+                    self.critic([c for c in children if c.status is Status.LEAF])
+                    frontier = [c for c in children if c.status is Status.LEAF]  # beam cut waits for finish()
+                    break
+                frontier = self._beam(children, depth)
+                if not frontier:
+                    break
+            if self.cfg["max_depth"] < 3:
+                for n in frontier:
+                    n.prune(f"depth limit {self.cfg['max_depth']} reached before a full trade spec")
+        except BudgetExhausted as exc:
+            self._stop(exc)
+
+    def _stop(self, exc: Exception) -> None:
+        self.stats["stopped_by"] = str(exc)
+        for n in self.tree.nodes:
+            if n.status is Status.OPEN and n.depth > 0:
+                n.prune(f"search stopped: {exc}")
+
+    def revise(self, parents: list[Node], feedback: str) -> list[Node]:
+        """Another round of depth-3 candidates under the given expiry nodes, with critic feedback in
+        the generator's facts. New leaves are built, verified and scored like the first ones."""
+        self.feedback = feedback
+        new: list[Node] = []
+        try:
+            for parent in parents:
+                tried = {c.spec.target_delta for c in self.tree.children(parent.id)}
+                self._tried = tried
+                kids = [c for c in self.expand(parent) if c.spec.target_delta not in tried]
+                for c in self.tree.children(parent.id):
+                    if c.status is Status.OPEN and c not in kids:   # repeats of earlier deltas
+                        c.prune("revision repeated an earlier delta")
+                for c in kids:
+                    c.detail["revision"] = True
+                    self.evaluate(c)
+                new += kids
+        except BudgetExhausted as exc:
+            self._stop(exc)
+        finally:
+            self.feedback, self._tried = "", set()
+        return [c for c in new if c.status is Status.LEAF]
+
+    def finish(self) -> ToTResult:
+        leaves = [n for n in self.tree.nodes if n.status is Status.LEAF]
+        self._beam(leaves, 3)
         leaves = sorted((n for n in self.tree.nodes if n.status is Status.LEAF),
                         key=lambda n: (-n.score, int(n.id[1:])))
+        outcome, reasons = self._outcome, self._reasons
         selected = leaves[0] if leaves and outcome == NO_TRADE else None
         if selected is not None:
             selected.status = Status.SELECTED
@@ -625,13 +697,21 @@ class Explorer:
             n.detail.pop("_key", None)
         self.stats["nodes"] = len(self.tree.nodes) - 1
         self.stats["pruned"] = sum(n.status is Status.PRUNED for n in self.tree.nodes if n.depth > 0)
-        self.stats["latency_ms"] = int((time.monotonic() - t0) * 1000)
+        self.stats["latency_ms"] = int((time.monotonic() - self._t0) * 1000)
         self.db.save_tot_nodes(self.run_id, [n.to_dict() for n in self.tree.nodes])
         self._trace("summary", {"outcome": outcome, "selected": selected.id if selected else None,
                                 "reasons": reasons, **self.stats}, "tot")
         self.db.finish_run(self.run_id, outcome, steps=self.stats["llm_calls"], tool_calls=self.stats["builds"],
                            bad_calls=self.stats["candidates_rejected"], eval_tokens=self.stats["eval_tokens"])
-        return ToTResult(self.run_id, outcome, self.tree, selected, reasons, self.stats, lm)
+        return ToTResult(self.run_id, outcome, self.tree, selected, reasons, self.stats, self.box.landmine_result or {})
+
+    def run(self) -> ToTResult:
+        root, _, stopped = self.begin()
+        if not stopped:
+            self.search(root)
+            if self.stats["stopped_by"]:
+                self.critic([n for n in self.tree.nodes if n.status is Status.LEAF])
+        return self.finish()
 
 
 def explore(box: ToolBox, pb: Playbook, llm: LLMClient | None, db: Database, masker: Masker,

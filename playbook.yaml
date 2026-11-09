@@ -149,3 +149,14 @@ tot:
   earnings_clearance_full_scale_days: 30
   liquidity_oi_multiple: 4              # full marks at 4 x the 500 open-interest floor
   exploration_slots: 1                  # EXTRA depth-2 node(s) on an expiry not yet in the beam (b + 1)
+
+# Module 5: multi-agent workflow (options_copilot/multi_agent). A LangGraph supervisor routes
+# deterministically; these caps bound the whole run on top of the tot: search budgets.
+multi_agent:
+  max_critic_rounds: 2                  # Strategist <-> Risk Critic exchanges (two-way, bounded)
+  max_llm_calls: 40                     # every LLM call in the run (agents, grader, brief writer)
+  max_builds: 36                        # build_and_verify calls through the MCP server
+  max_wall_seconds: 900                 # wall-clock cap for one run
+  min_relevant_chunks: 2                # Researcher: fewer graded-relevant chunks -> one query rewrite
+  max_query_rewrites: 1                 # at most one rewrite (cannot be raised above 1)
+  agent_max_iter: 3                     # CrewAI reasoning/tool iterations per task

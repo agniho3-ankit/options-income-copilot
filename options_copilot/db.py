@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS journal (
     date_closed TEXT, close_cost REAL, pnl REAL, pnl_pct REAL, return_on_risk_pct REAL,
     days_held INTEGER, annualized_pct REAL, exit_rule TEXT, notes TEXT, synthetic INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS spans (
+    run_id TEXT NOT NULL REFERENCES runs(run_id), span_id TEXT NOT NULL, parent_id TEXT, agent TEXT NOT NULL,
+    pattern TEXT, started_at TEXT NOT NULL, ended_at TEXT, duration_ms INTEGER, llm_calls INTEGER DEFAULT 0,
+    input_summary TEXT, output_summary TEXT, error TEXT, PRIMARY KEY (run_id, span_id)
+);
 CREATE TABLE IF NOT EXISTS iv_history (
     ticker TEXT NOT NULL, as_of TEXT NOT NULL, atm_iv REAL NOT NULL, expiry TEXT, dte INTEGER,
     created_at TEXT NOT NULL, PRIMARY KEY (ticker, as_of)
@@ -68,7 +73,9 @@ class Database:
     def __init__(self, path: Path | str):
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path))
+        # check_same_thread=False: the in-process MCP bridge runs tools on its event-loop thread;
+        # calls are strictly sequential (the caller waits on each one), so access never overlaps.
+        self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
 
@@ -206,6 +213,20 @@ class Database:
 
     def journal(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM journal ORDER BY date_opened, position_id")]
+
+    # spans: one per node execution of a multi-agent run (summaries are masked by the caller)
+    def add_span(self, run_id: str, span_id: str, parent_id: str | None, agent: str, pattern: str | None,
+                 started_at: str, ended_at: str, duration_ms: int, llm_calls: int, input_summary: Any,
+                 output_summary: Any, error: str | None = None) -> None:
+        enc = lambda v: v if v is None or isinstance(v, str) else json.dumps(v, default=str)  # noqa: E731
+        with self.conn:
+            self.conn.execute("INSERT INTO spans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (run_id, span_id, parent_id, agent, pattern, started_at, ended_at, duration_ms,
+                               llm_calls, enc(input_summary), enc(output_summary), error))
+
+    def spans(self, run_id: str) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM spans WHERE run_id = ? ORDER BY started_at, rowid", (run_id,))
+        return [dict(r) for r in rows]
 
     # daily IV snapshots (one per ticker per day; a re-run the same day replaces it)
     def add_iv_snapshot(self, ticker: str, as_of: str, atm_iv: float, expiry: str | None, dte: int | None) -> None:

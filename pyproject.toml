@@ -16,6 +16,11 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "chromadb>=1.0",
     "yfinance>=0.2.40",
+    # Phase 5 multi-agent layer. Pinned: CrewAI needs mcp<2 and pydantic<2.13.
+    "langgraph==1.2.17",
+    "crewai==1.15.30",
+    "mcp==1.30.0",
+    "pydantic>=2.11.9,<2.13",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +38,10 @@ options_copilot = ["*.yaml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m 'not llm and not network'"
+filterwarnings = [
+    # CrewAI warns about its own internal use of deprecated fields; nothing in our code triggers it
+    "ignore::DeprecationWarning:crewai.*",
+]
 markers = [
     "llm: needs a running Ollama model (skipped by default; run with -m llm)",
     "network: needs internet access (skipped by default; run with -m network)",
