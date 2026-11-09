@@ -553,13 +553,15 @@ def cmd_tot(args: argparse.Namespace) -> int:
     db = _db(settings)
     box = _live_box(settings, pb, as_of, args.ticker)
     result = explore(box, pb, None if args.no_llm else build_llm(settings), db,
-                     Masker(settings.synthetic_portfolio_value), use_critic=False if args.no_critic else None)
-    text = "\n".join([f"== Tree-of-Thought {box.ticker} as of {as_of} | run {result.run_id} | {result.outcome} ==",
+                     Masker(settings.synthetic_portfolio_value), use_critic=False if args.no_critic else None,
+                     exhaustive=args.exhaustive)
+    mode = " | EXHAUSTIVE (no beam)" if args.exhaustive else ""
+    text = "\n".join([f"== Tree-of-Thought {box.ticker} as of {as_of} | run {result.run_id} | {result.outcome}{mode} ==",
                       render_tree(result.tree, result.stats), summary_text(result),
                       "(no brief written; use `brief TICKER --tot` to write one)"])
     print(text)
     if args.save:
-        _save(settings, f"tot_{box.ticker}_{as_of}", {"run": db.run(result.run_id), "outcome": result.outcome,
+        _save(settings, f"tot_{box.ticker}_{as_of}" + ("_exhaustive" if args.exhaustive else ""), {"run": db.run(result.run_id), "outcome": result.outcome,
               "reasons": result.reasons, "stats": result.stats, "tree": json.loads(result.tree.to_json())}, text)
     return 0
 
@@ -952,6 +954,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--as-of")
     p.add_argument("--no-llm", action="store_true", help="deterministic generator only (no LLM calls)")
     p.add_argument("--no-critic", action="store_true", help="skip the optional LLM critic")
+    p.add_argument("--exhaustive", action="store_true",
+                   help="offline check: price every strategy x expiry x 5 deltas (no beam, no LLM)")
     p.add_argument("--save", action="store_true")
     p.set_defaults(func=cmd_tot)
 

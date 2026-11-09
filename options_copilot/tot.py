@@ -181,6 +181,31 @@ def score_proposal(box: ToolBox, pb: Playbook, pid: str) -> tuple[float, dict[st
     return score_trade(pb, prop.proposal, prop.numbers, d.profile.price, d.support, d.resistance, box.iv_rank())
 
 
+def score_expiry(pb: Playbook, expiry: date, as_of: date, earnings: date | None, quotes: list,
+                 spot: float) -> tuple[float, dict[str, float]]:
+    """Deterministic depth-2 score for an expiry: DTE fit to the target, days of clearance before
+    earnings, and liquidity where the short strikes sit (median open interest of the strikes whose
+    |delta| is inside the playbook's delta bands). Unknown inputs score 0. Weights: tot.expiry_weights."""
+    from .calculators import _delta
+    w = pb["tot.expiry_weights"]
+    dte, target = (expiry - as_of).days, pb["entry.dte_target"]
+    half = max(target - pb["entry.dte_min"], pb["entry.dte_max"] - target, 1)
+    lo = min(pb["builder.short_delta_min"], pb["builder.condor_short_delta_min"])
+    hi = max(pb["builder.short_delta_max"], pb["builder.condor_short_delta_max"])
+    ois = sorted(q.open_interest or 0 for q in quotes
+                 if (d := _delta(q, spot, as_of)) is not None and lo <= abs(d) <= hi)
+    median = (ois[len(ois) // 2] if len(ois) % 2 else (ois[len(ois) // 2 - 1] + ois[len(ois) // 2]) / 2) if ois else 0
+    scale = pb["entry.open_interest_min"] * pb["tot.liquidity_oi_multiple"]
+    comps = {
+        "dte_fit": _clamp(1 - abs(dte - target) / half),
+        "earnings_clearance": 0.0 if earnings is None else
+        _clamp((earnings - expiry).days / pb["tot.earnings_clearance_full_scale_days"]),
+        "liquidity": _clamp(median / scale) if scale > 0 else 0.0,
+    }
+    comps = {k: round(v, 4) for k, v in comps.items()}
+    return round(sum(w[k] * comps[k] for k in comps), 4), comps
+
+
 def allowed_strategies(pb: Playbook, ticker: str, price: float, earnings: date | None,
                        as_of: date) -> tuple[list[Strategy], dict[str, str]]:
     """Strategies the playbook allows for this ticker now (fallback order), plus why others are out."""
@@ -268,9 +293,13 @@ def _parse_json(text: str) -> Any:
 
 class Explorer:
     def __init__(self, box: ToolBox, pb: Playbook, llm: LLMClient | None, db: Database, masker: Masker,
-                 *, use_critic: bool | None = None):
+                 *, use_critic: bool | None = None, exhaustive: bool = False):
         self.box, self.pb, self.llm, self.db, self.masker = box, pb, llm, db, masker
-        self.cfg = pb["tot"]
+        self.cfg = dict(pb["tot"])
+        self.exhaustive = exhaustive
+        if exhaustive:  # offline check: every strategy x expiry x 5 deltas, deterministic, no beam cut
+            self.cfg.update(beam_width=10_000, children_per_node=10_000, max_builds=10_000, exploration_slots=0)
+            self.llm, use_critic = None, False
         self.use_critic = self.cfg["llm_critic"] if use_critic is None else use_critic
         self.tree = Tree(box.ticker, box.as_of.isoformat())
         self.results: dict[str, tuple[str, VerifierResult]] = {}
@@ -374,7 +403,8 @@ class Explorer:
         if node.depth == 1:
             return [(e, f"fallback: {(date.fromisoformat(e) - self.box.as_of).days} DTE, nearest the target first")
                     for e in allowed[:k]]
-        return [(v, "fallback: evenly spaced inside the delta band") for v in fallback_deltas(*allowed, k)]
+        return [(v, "fallback: evenly spaced inside the delta band")
+                for v in fallback_deltas(*allowed, 5 if self.exhaustive else k)]
 
     def _schema(self, node: Node, allowed: list[Any]) -> dict:
         field_name = LEVELS[node.depth + 1]
@@ -418,8 +448,22 @@ class Explorer:
             setattr(spec, level, v)
             if level == "target_delta":
                 spec.wing_width_pct = self.pb["builder.wing_width_pct"]
-            children.append(self._new(node, spec, why, source, rank))
+            child = self._new(node, spec, why, source, rank)
+            if level == "expiry":
+                self._score_expiry(child)
+            children.append(child)
         return children
+
+    def _score_expiry(self, node: Node) -> None:
+        expiry = date.fromisoformat(node.spec.expiry)
+        if expiry not in self.box._chains:
+            self.box._chains[expiry] = self.box.sources.chain(self.box.ticker, expiry)
+        d = self.box._data()
+        quotes = self.box._chains[expiry][0]
+        node.detail["expiry_score"], node.detail["expiry_components"] = score_expiry(
+            self.pb, expiry, self.box.as_of, d.profile.earnings_date, quotes, d.profile.price)
+        if not quotes:
+            node.prune(f"no option quotes listed for {expiry}")
 
     def evaluate(self, node: Node) -> None:
         """Deterministic critic for one leaf: build -> compute -> verify, then score."""
@@ -465,12 +509,35 @@ class Explorer:
         return score_proposal(self.box, self.pb, pid)
 
     def _beam(self, nodes: list[Node], depth: int) -> list[Node]:
-        """Keep at most b open nodes: round-robin by generator rank across parents (leaves by score)."""
+        """Keep at most b open nodes. Depth 1: round-robin by generator rank across parents.
+        Depth 2: round-robin across parents (strategies), each parent's expiries ordered by the
+        deterministic expiry score, plus `exploration_slots` EXTRA nodes: the best-scoring nodes whose
+        expiry is not yet in the beam (so depth 2 keeps up to b + exploration_slots). Depth 3: leaves
+        by score."""
         b = self.cfg["beam_width"]
+        order = {pid: i for i, pid in enumerate(dict.fromkeys(n.parent_id for n in nodes))}
         if depth == 3:
             alive = sorted((n for n in nodes if n.status is Status.LEAF), key=lambda n: (-n.score, int(n.id[1:])))
+        elif depth == 2:
+            open_ = [n for n in nodes if n.status is Status.OPEN]
+            place = {}
+            for pid in order:
+                kids = sorted((n for n in open_ if n.parent_id == pid),
+                              key=lambda n: (-n.detail.get("expiry_score", 0), n.rank))
+                place.update({n.id: i for i, n in enumerate(kids)})
+            alive = sorted(open_, key=lambda n: (place[n.id], order[n.parent_id]))
+            kept, rest = alive[:b], alive[b:]
+            for _ in range(self.cfg["exploration_slots"]):
+                seen = {n.spec.expiry for n in kept}
+                fresh = [n for n in rest if n.spec.expiry not in seen]
+                if not fresh:
+                    break
+                pick = min(fresh, key=lambda n: (-n.detail.get("expiry_score", 0), place[n.id], order[n.parent_id]))
+                pick.detail["exploration"] = True
+                kept.append(pick)
+                rest.remove(pick)
+            alive, b = kept + rest, len(kept)
         else:
-            order = {pid: i for i, pid in enumerate(dict.fromkeys(n.parent_id for n in nodes))}
             alive = sorted((n for n in nodes if n.status is Status.OPEN), key=lambda n: (n.rank, order[n.parent_id]))
         for i, n in enumerate(alive[b:], start=b + 1):
             n.prune(f"beam: ranked {i} at depth {depth}, width {b}"
@@ -568,8 +635,8 @@ class Explorer:
 
 
 def explore(box: ToolBox, pb: Playbook, llm: LLMClient | None, db: Database, masker: Masker,
-            *, use_critic: bool | None = None) -> ToTResult:
-    return Explorer(box, pb, llm, db, masker, use_critic=use_critic).run()
+            *, use_critic: bool | None = None, exhaustive: bool = False) -> ToTResult:
+    return Explorer(box, pb, llm, db, masker, use_critic=use_critic, exhaustive=exhaustive).run()
 
 
 # --- outputs --------------------------------------------------------------------------------
@@ -605,6 +672,9 @@ def render_tree(tree: Tree, stats: dict[str, Any] | None = None) -> str:
         else:
             src = f"({n.source}) " if n.source != "root" else ""
             head = f"{n.id} {n.label()}  {src}"
+            if "expiry_score" in n.detail:
+                head += f"[expiry score {n.detail['expiry_score']}" + (", exploration" if n.detail.get("exploration")
+                                                                        else "") + "] "
             if n.rationale:
                 head += f'"{n.rationale}"'
         if n.status is Status.PRUNED:

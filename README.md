@@ -89,6 +89,7 @@ each produce a short Reflexion lesson in the `reflections` collection.
 # Tree-of-Thought trade explorer (Phase 4, Module 4)
 python -m options_copilot.cli tot MSFT --save            # explore candidate trades; print the tree
 python -m options_copilot.cli tot MSFT --no-llm          # deterministic generator only
+python -m options_copilot.cli tot MSFT --exhaustive      # offline check: every strategy x expiry x 5 deltas
 python -m options_copilot.cli brief MSFT --tot           # brief from the ToT pick, with alternatives considered
 python -m options_copilot.cli tot-compare MSFT --save    # linear ReAct pick vs ToT pick, side by side
 ```
@@ -154,8 +155,11 @@ depth 3 the short-delta target inside the strategy's band. Wings stay at the pla
    risk, position-risk headroom, IV rank, and short-strike distance beyond support/resistance. An
    optional LLM critic may lower a score (by a playbook penalty factor) or veto a leaf, with a
    cited reason. It can never raise a score or revive a pruned node.
-4. **Controller.** Beam search keeps `beam_width` nodes per depth (round-robin across parents,
-   leaves by score), with a depth limit and hard budgets on builds and LLM calls; hitting a budget
+4. **Controller.** Beam search keeps `beam_width` nodes per depth. Depth 1 is round-robin by
+   generator rank. Depth 2 is round-robin across strategies, each ordered by a deterministic
+   expiry score (DTE fit, days of clearance before earnings, median open interest where the short
+   strikes sit; weights in `tot.expiry_weights`), plus one extra exploration node on an expiry not
+   yet in the beam. Leaves are ranked by score, with a depth limit and hard budgets on builds and LLM calls; hitting a budget
    stops the search. The best surviving leaf wins. If nothing survives the result is `NO_TRADE`
    with the prune reasons; a trade is never forced.
 5. **State.** Every node (spec, rationale, score, prune reason, timing) goes to the `tot_nodes`

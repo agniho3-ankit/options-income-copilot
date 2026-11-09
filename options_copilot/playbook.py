@@ -130,6 +130,12 @@ SPEC: dict[str, Rule] = {
     "tot.weights.sr_distance": Rule(NUM, 0, 1),
     "tot.return_on_risk_full_scale": Rule(NUM, 0.01, 10),
     "tot.sr_distance_full_scale_pct": _pct(50),
+    "tot.expiry_weights.dte_fit": Rule(NUM, 0, 1),
+    "tot.expiry_weights.earnings_clearance": Rule(NUM, 0, 1),
+    "tot.expiry_weights.liquidity": Rule(NUM, 0, 1),
+    "tot.earnings_clearance_full_scale_days": _days(1),
+    "tot.liquidity_oi_multiple": Rule(NUM, 0.1, 100),
+    "tot.exploration_slots": Rule(int, 0, 9),
 }
 
 
@@ -189,6 +195,9 @@ def _check_consistency(v: dict[str, Any]) -> list[str]:
     if abs(weights - 10) > 1e-9:
         errors.append(f"screener.quality_weights must sum to 10, got {weights}")
 
+    exp_weights = sum(v[k] for k in v if k.startswith("tot.expiry_weights."))
+    if abs(exp_weights - 1) > 1e-9:
+        errors.append(f"tot.expiry_weights must sum to 1, got {exp_weights:g}")
     tot_weights = sum(v[k] for k in v if k.startswith("tot.weights."))
     if abs(tot_weights - 1) > 1e-9:
         errors.append(f"tot.weights must sum to 1, got {tot_weights:g}")

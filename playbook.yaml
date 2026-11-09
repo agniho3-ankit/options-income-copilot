@@ -8,7 +8,7 @@
 # "Skill #N" refers to the sections of the owner's original written playbook.
 # Educational project only. These are one person's rules, not financial advice.
 
-version: 4
+version: 5
 
 # Decision tree: a new position needs the ticker on Tier 1 or Tier 2.
 # Watch names are screened and briefed but cannot be entered until promoted.
@@ -141,3 +141,11 @@ tot:
     sr_distance: 0.15                   # short strike beyond support/resistance, % of price
   return_on_risk_full_scale: 0.50
   sr_distance_full_scale_pct: 5.0
+  # Depth-2 expiry ranking (deterministic; replaces generator order) and beam exploration.
+  expiry_weights:                       # each part scaled to 0-1; weights sum to 1
+    dte_fit: 0.50                       # 1 - |DTE - target| / 15 (0 at the window edges)
+    earnings_clearance: 0.25            # days from expiry to earnings / scale below; unknown scores 0
+    liquidity: 0.25                     # median OI of strikes inside the delta bands / (open_interest_min x multiple)
+  earnings_clearance_full_scale_days: 30
+  liquidity_oi_multiple: 4              # full marks at 4 x the 500 open-interest floor
+  exploration_slots: 1                  # EXTRA depth-2 node(s) on an expiry not yet in the beam (b + 1)

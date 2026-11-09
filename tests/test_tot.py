@@ -236,7 +236,8 @@ def test_beam_width_respected_at_every_depth(tmp_path, repo_root, width):
     result, _, _ = run(pb)
     for depth in (1, 2, 3):
         alive = [n for n in result.tree.nodes if n.depth == depth and n.status is not Status.PRUNED]
-        assert len(alive) <= width
+        extra = pb["tot.exploration_slots"] if depth == 2 else 0   # the exploration node is extra
+        assert len(alive) <= width + extra
     assert any("beam:" in n.prune_reason for n in result.tree.nodes) or width == 3
 
 
@@ -393,3 +394,80 @@ def test_tot_brief_lists_alternatives(pb):
     text = _render_brief(b)
     assert "alternatives considered" in text and "open_interest" in text
     assert result.selected.path() in summary_text(result)
+
+
+# --- depth-2 mitigation: deterministic expiry score + exploration slot ----------------------
+
+EXP2 = AS_OF + timedelta(days=38)
+
+
+class TwoExpiries(FakeSources):
+    """A second listed expiry (38 DTE) with a thinner market than the 45-DTE one."""
+
+    def expiries(self, ticker):
+        return sorted({*super().expiries(ticker), EXP2})
+
+    def chain(self, ticker, expiry):
+        if expiry == EXP2:
+            quotes, flow = super().chain(ticker, EXP)
+            return [replace(q, expiry=EXP2, open_interest=600) for q in quotes], flow
+        return super().chain(ticker, expiry)
+
+
+def test_expiry_score_is_deterministic(pb):
+    from options_copilot.tot import score_expiry
+    quotes = FakeSources().chain(TICKER, EXP)[0]
+    earnings = AS_OF + timedelta(days=70)
+    a = score_expiry(pb, EXP, AS_OF, earnings, quotes, 100.0)
+    assert a == score_expiry(pb, EXP, AS_OF, earnings, quotes, 100.0)
+    score, c = a
+    assert c["dte_fit"] == 1.0 and c["earnings_clearance"] == round(min(25 / 30, 1), 4)
+    assert c["liquidity"] == round(1000 / (500 * 4), 4)        # median OI of in-band strikes / 2,000
+    assert score == round(0.5 * c["dte_fit"] + 0.25 * c["earnings_clearance"] + 0.25 * c["liquidity"], 4)
+    edge = score_expiry(pb, AS_OF + timedelta(days=30), AS_OF, None, quotes, 100.0)[1]
+    assert edge["dte_fit"] == 0.0 and edge["earnings_clearance"] == 0.0   # unknown earnings never rewarded
+    assert score_expiry(pb, EXP, AS_OF, earnings, [], 100.0)[1]["liquidity"] == 0.0
+    thin = [replace(q, open_interest=10) if 0.12 <= abs(q.delta) <= 0.30 else q for q in quotes]
+    assert score_expiry(pb, EXP, AS_OF, earnings, thin, 100.0)[1]["liquidity"] == round(10 / 2000, 4)
+
+
+def test_depth2_ranks_by_expiry_score_and_explores_a_second_expiry(pb):
+    result, _, _ = run(pb, TwoExpiries())
+    depth2 = [n for n in result.tree.nodes if n.depth == 2]
+    alive = [n for n in depth2 if n.status is not Status.PRUNED]
+    assert len(alive) == pb["tot.beam_width"] + pb["tot.exploration_slots"]
+    assert {n.spec.expiry for n in alive} == {EXP.isoformat(), EXP2.isoformat()}
+    explored = [n for n in alive if n.detail.get("exploration")]
+    assert len(explored) == 1 and explored[0].spec.expiry == EXP2.isoformat()
+    best = [n for n in alive if not n.detail.get("exploration")]
+    assert all(n.detail["expiry_score"] >= explored[0].detail["expiry_score"] for n in best)
+    priced = {n.spec.expiry for n in result.tree.nodes if n.depth == 3 and "numbers" in n.detail}
+    assert EXP2.isoformat() in priced            # the exploration branch was actually built
+
+
+def test_exploration_can_be_switched_off(tmp_path, repo_root):
+    pb0 = pb_with(tmp_path, repo_root, tot__exploration_slots=0)
+    result, _, _ = run(pb0, TwoExpiries())
+    alive = [n for n in result.tree.nodes if n.depth == 2 and n.status is not Status.PRUNED]
+    assert {n.spec.expiry for n in alive} == {EXP.isoformat()}
+
+
+def test_exhaustive_mode_bounds_the_beam(pb):
+    beam, _, _ = run(pb, TwoExpiries())
+    full, _, _ = run(pb, TwoExpiries(), exhaustive=True)
+    assert full.stats["builds"] > beam.stats["builds"] and full.stats["llm_calls"] == 0
+    assert full.selected.score >= beam.selected.score
+    assert not any(n.prune_reason.startswith("beam:") for n in full.tree.nodes if n.depth < 3)
+
+
+def test_expiry_weights_are_validated(tmp_path, repo_root):
+    with pytest.raises(PlaybookError, match="tot.expiry_weights must sum to 1"):
+        pb_with(tmp_path, repo_root, tot__expiry_weights={"dte_fit": 0.5, "earnings_clearance": 0.5, "liquidity": 0.5})
+
+
+def test_depth2_keeps_every_strategy_and_a_second_expiry(pb):
+    result, _, _ = run(pb, TwoExpiries())
+    strategies = {n.spec.strategy for n in result.tree.nodes if n.depth == 1 and n.status is not Status.PRUNED}
+    alive = [n for n in result.tree.nodes if n.depth == 2 and n.status is not Status.PRUNED]
+    assert {n.spec.strategy for n in alive} == strategies          # no strategy loses all its expiries
+    assert len({n.spec.expiry for n in alive}) == 2
