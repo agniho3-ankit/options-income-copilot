@@ -25,6 +25,8 @@ def make_brief(result: AgentResult, box: ToolBox, db: Database, as_of: date,
     parts = box.accepted_brief_parts()
     if parts is None:
         return None
+    from .guardrails import forbid_in_sandbox
+    forbid_in_sandbox("creating a brief")
     if not box.lessons_used:
         box.search_lessons()  # every brief shows relevant lessons, even if the agent skipped the tool
     lm = box.landmine_result or {}
@@ -85,15 +87,21 @@ def approve(db: Database, brief_id: str, note: str = "") -> str:
     return db.add_ticket(brief_id, ticket)
 
 
-def reject(db: Database, brief_id: str, reason: str, *, llm: LLMClient | None, store: Any, masker: Masker):
+def reject(db: Database, brief_id: str, reason: str, *, llm: LLMClient | None, store: Any, masker: Masker,
+           code: str | None = None, codes: tuple[str, ...] | None = None):
+    """Reject a pending brief. `code` must be one of the playbook's `guardrails.reject_codes`
+    (`codes`); it is stored on the brief and with the lesson so `metrics` can count it."""
     if not reason.strip():
         raise ValueError("a rejection needs a reason (it becomes a lesson)")
+    if code is not None and codes is not None and code not in codes:
+        raise ValueError(f"unknown reject code {code!r}; choose one of: {', '.join(codes)}")
     b = db.brief(brief_id)
     if b is None:
         raise ValueError(f"no brief {brief_id}")
-    db.decide(brief_id, "rejected", reason)
+    db.decide(brief_id, "rejected", reason, code=code)
     p = b["payload"]
     return write_lesson(ReflectionTrigger.REJECTION, b["ticker"],
                         {"strategy": p["proposal"]["strategy"] if "proposal" in p else p.get("strategy"),
-                         "brief_kind": b["kind"], "reason": reason, "risks": p.get("risks", [])},
-                        llm=llm, store=store, masker=masker, tags=["rejection"])
+                         "brief_kind": b["kind"], "reason": reason, "reject_code": code, "risks": p.get("risks", [])},
+                        llm=llm, store=store, masker=masker,
+                        tags=["rejection", *([f"code:{code}"] if code else [])])

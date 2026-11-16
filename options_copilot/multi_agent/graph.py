@@ -31,6 +31,7 @@ from typing import Any, Callable
 from . import privacy  # noqa: F401 - must precede the framework imports
 from langgraph.graph import END, START, StateGraph
 
+from .. import guardrails as G
 from ..agent_tools import ToolBox
 from ..calculators import BuildError
 from ..db import Database
@@ -124,6 +125,16 @@ class Runtime:
     last_supervisor_span: str | None = None
     session_span: str = ""
     spans: list[dict] = field(default_factory=list)
+    guard: G.GuardrailLog | None = None   # Phase 6: every guardrail decision of the run
+    tokens: int = 0
+    fallbacks: int = 0
+    signals: dict = field(default_factory=dict)
+
+    def emit(self, name: str, decision: str, reason: str, *, signal: str | None = None, data: Any = None) -> None:
+        if self.guard is not None:
+            self.guard.emit(name, decision, reason, signal=signal, data=data)
+        if signal:
+            self.signals[signal] = self.signals.get(signal, 0) + 1
 
     @property
     def cfg(self) -> dict:
@@ -146,7 +157,10 @@ class CountingLLM:
         self.rt.llm_calls += 1
         self.rt.trace("user", messages[-1]["content"], agent)
         t0 = time.monotonic()
+        before = getattr(self.inner, "fallbacks", 0)
         resp = self.inner.chat(messages, json_schema=json_schema, tools=tools)
+        self.rt.fallbacks += getattr(self.inner, "fallbacks", 0) - before
+        self.rt.tokens += int(resp.eval_tokens or 0)
         self.rt.trace("assistant", resp.content or "", agent, duration_ms=int((time.monotonic() - t0) * 1000),
                       eval_tokens=resp.eval_tokens)
         return resp
@@ -188,18 +202,24 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
         attempts: list[dict] = []
         notes: list[str] = []
 
+        _views: list[dict] = []
+
         def attempt(query: str | None) -> dict:
             view = rt.bridge.call("search_filings", {"ticker": ticker, "query": query})
             graded, relevant = grade(view)
             a = {"query": view.get("query"), "verdict": view["verdict"], "coverage": view.get("coverage"),
                  "coverage_ok": bool((view.get("coverage") or {}).get("ok")), "relevant": relevant, "graded": graded,
                  "citations": view.get("citations", []), "event_dates": view.get("event_dates", []),
-                 "reasons": view.get("reasons")}
+                 "reasons": view.get("reasons"), "confidence": view.get("confidence"), "p_true": view.get("p_true"),
+                 "p_true_method": view.get("p_true_method"), "llm_asked": view.get("llm_asked", False),
+                 "guard_notes": view.get("guard_notes", [])}
             attempts.append(a)
             return a
 
         def grade(view: dict) -> tuple[bool, int | None]:
             ev = view.get("evidence", [])
+            if G.disabled("grader_rewrite"):   # ablation sandbox only
+                return False, None
             if not ev:            # nothing retrieved (e.g. a coverage miss): zero relevant, no LLM needed
                 return True, 0
             if rt.llm is None:
@@ -220,6 +240,7 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
                 return False, None
 
         first = attempt(None)
+        _views.append(first)
         second = None
         need = rt.cfg["min_relevant_chunks"]
         if first["graded"] and first["relevant"] < need and rt.cfg["max_query_rewrites"] >= 1 and rt.llm is not None:
@@ -234,6 +255,7 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
                     rt.trace("tool", {"rewrite": {"from": first["query"], "to": q,
                                                   "relevant_before": first["relevant"]}}, "researcher.rewrite")
                     second = attempt(f"{ticker} {q}" if ticker not in q.upper() else q)
+                    _views.append(second)
             except (LLMError, ValueError, json.JSONDecodeError, AttributeError) as exc:
                 notes.append(f"query rewrite failed ({str(exc)[:80]})")
         verdict, src = merge_research(first, second)
@@ -243,13 +265,22 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
         events = list({json.dumps(e, sort_keys=True): e for a in attempts for e in a["event_dates"]}.values())
         rt.box.landmine_result = {"verdict": verdict, "citations": cites, "event_dates": events,
                                   "reasons": [f"multi-agent researcher: {len(attempts)} retrieval(s)"]}
+        _research_events(rt, attempts, verdict)
+        conf = {"verbal": src.get("confidence"), "p_true": src.get("p_true"), "p_true_method": src.get("p_true_method"),
+                "llm_asked": src.get("llm_asked", False)}
         research = {"verdict": verdict, "citations": cites, "coverage": src.get("coverage"),
-                    "attempts": [{k: a[k] for k in ("query", "verdict", "coverage_ok", "relevant", "graded")}
+                    "attempts": [{k: a[k] for k in ("query", "verdict", "coverage_ok", "relevant", "graded",
+                                                    "confidence", "p_true")}
                                  for a in attempts],
                     "rewrites": len(attempts) - 1, "reasons": src.get("reasons"),
                     "escalation": (f"{verdict}: escalated to the owner; no strategy was explored"
                                    if verdict in ESCALATE else None)}
-        out = {"research": research, "budgets": _sync(state, rt),
+        rt.landmine_attempts = attempts
+        rt.landmine_conf = conf
+        if verdict in ESCALATE:   # no strategist will run: the confidence gate closes the researcher stage
+            _landmine_confidence_gate(rt, conf, verdict)
+        out = {"research": research, "budgets": _sync(state, rt), "confidence": {"landmine": conf},
+               "signals": dict(rt.signals),
                "messages": _msg(state, "researcher", "supervisor", "one-way",
                                 {"verdict": verdict, "rewrites": research["rewrites"]})}
         if notes:
@@ -273,15 +304,30 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
             if not stopped:
                 ex.search(root)
             fresh = [n for n in ex.tree.nodes if n.status is Status.LEAF]
+            rejected = [r for n in ex.tree.nodes for r in n.detail.get("rejected_candidates", [])]
+            thin = sorted({t for n in ex.tree.nodes for t in n.detail.get("thin_expiries", [])})
+            parts = ([f"{len(rejected)} generator candidate(s) rejected as outside the playbook"] if rejected else []) + \
+                    ([f"{len(thin)} thin expiry(ies) withheld by the liquidity floor"] if thin else [])
+            rt.emit("playbook_bands", "block" if parts else "pass",
+                    "; ".join(parts) or "every generator candidate was inside the playbook strategies, DTE window "
+                                        "and bands", data=(rejected[:6] + thin[:6]) or None)
+            _landmine_confidence_gate(rt, getattr(rt, "landmine_conf", {}), (state.get("research") or {}).get("verdict"))
             msg = _msg(state, "supervisor", "strategist", "one-way", {"task": "explore candidates"})
             msg = [*msg, {"from": "strategist", "to": "strategist", "pattern": "brainstorming",
                           "summary": {"nodes": len(ex.tree.nodes) - 1, "leaves": len(fresh)}}]
             return {"strategist_done": True, "tot_run_id": ex.run_id, "pending_review": [n.id for n in fresh],
-                    "candidates": _candidates(ex), "budgets": _sync(state, rt), "messages": msg}
+                    "candidates": _candidates(ex), "budgets": _sync(state, rt), "messages": msg,
+                    "signals": dict(rt.signals)}
         parents = [n for n in (ex.tree.get(i) for i in state.get("revise", [])) if n is not None]
+        n_before = len(ex.tree.nodes)
         fresh = ex.revise(parents, state.get("critic_feedback", ""))
+        made = [n for n in ex.tree.nodes[n_before:] if n.depth == 3]
+        dups = [n for n in made if n.status is Status.PRUNED and n.prune_reason.startswith(
+            ("revision repeated", "same strikes as"))]
+        if parents and made and len(dups) == len(made):
+            rt.signals["revisions_all_duplicates"] = rt.signals.get("revisions_all_duplicates", 0) + 1
         return {"revise": [], "pending_review": [n.id for n in fresh], "candidates": _candidates(ex),
-                "budgets": _sync(state, rt),
+                "budgets": _sync(state, rt), "signals": dict(rt.signals),
                 "messages": _msg(state, "strategist", "risk_critic", "two-way",
                                  {"revised_under": [p.id for p in parents], "new_leaves": len(fresh)})}
 
@@ -306,15 +352,18 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
         schema = {"type": "object", "properties": {"reviews": {"type": "array", "items": {"type": "object", "properties": {
             "node_id": {"type": "string", "enum": [n.id for n in leaves]},
             "action": {"type": "string", "enum": list(CRITIC_ACTIONS)}, "reason": {"type": "string"},
-            "cite": {"type": "string", "enum": sorted(cites)}}, "required": ["node_id", "action", "reason", "cite"]}}},
+            "cite": {"type": "string", "enum": sorted(cites)}, "confidence": {"type": "number"}},
+            "required": ["node_id", "action", "reason", "cite", "confidence"]}}},
             "required": ["reviews"]}
         notes: list[str] = []
+        raw = None
         try:
-            raw = _json(rt.json_task(rt.critic, CRITIC_SYSTEM, user, schema))
+            raw = _json(rt.json_task(rt.critic, CRITIC_SYSTEM + CRITIC_CONFIDENCE, user, schema))
             notes = apply_critique({n.id: n for n in leaves}, raw.get("reviews"), dict(rt.pb["tot.critic_penalty"]),
                                    cites, rt.masker)
         except Exception as exc:  # noqa: BLE001 - a failed critic leaves scores unchanged
             notes = [f"critic failed, scores unchanged: {str(exc)[:120]}"]
+        _critic_events(rt, ex, leaves, raw, notes)
         hit = [n for n in leaves if n.detail.get("critic", {}).get("action") in ("lower_minor", "lower_major", "veto")
                and n.detail["critic"].get("round") is None]
         for n in hit:
@@ -334,8 +383,10 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
         ex = rt.explorer
         why = exhausted(state)
         if ex is None:  # budget ran out before any strategy was explored
+            _gate_events(rt, state, why, None, None, None)
             return {"gate_done": True, "outcome": NO_TRADE, "verifier": None, "chosen": None,
-                    "reasons": [why or "no candidates were explored"], "budgets": _sync(state, rt)}
+                    "reasons": [why or "no candidates were explored"], "budgets": _sync(state, rt),
+                    "signals": dict(rt.signals)}
         if why:
             ex.stats["stopped_by"] = ex.stats["stopped_by"] or why
         result = ex.finish()
@@ -359,7 +410,8 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
                 result.reasons = [f"verifier gate rejected {n.path()}: "
                                   + ("; ".join(ver.get("failures", [])) or ver.get("error", "strikes changed"))]
         outcome = SELECTED if chosen else (result.outcome if result.outcome != SELECTED else NO_TRADE)
-        return {"gate_done": True, "outcome": outcome, "verifier": ver, "chosen": chosen,
+        _gate_events(rt, state, why or ex.stats.get("stopped_by"), ver, chosen, result)
+        return {"gate_done": True, "outcome": outcome, "verifier": ver, "chosen": chosen, "signals": dict(rt.signals),
                 "reasons": [] if chosen else (result.reasons or ["no candidate survived"]),
                 "candidates": _candidates(ex), "budgets": _sync(state, rt),
                 "messages": _msg(state, "verifier_gate", "brief_writer", "one-way",
@@ -371,21 +423,54 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
         if state.get("outcome") != SELECTED or rt.box.accepted is None:
             return {"brief_id": None, "messages": _msg(state, "brief_writer", "learner", "one-way",
                                                       {"outcome": state.get("outcome")})}
+        from ..judge import judge_brief
         prose = write_prose(rt, state)
+        parts = rt.box.accepted_brief_parts()
+        tool_numbers = (state.get("verifier") or {}).get("numbers") or {}
+        problems = G.brief_number_problems({k: parts["numbers"].get(k) for k in tool_numbers}, tool_numbers)
+        if problems:   # hard check: a brief whose numbers differ from the verified tool numbers is never written
+            rt.emit("brief_numbers", "block", "; ".join(problems)[:300])
+            return {"brief_id": None, "outcome": NO_TRADE, "reasons": ["brief numbers did not match the tools"],
+                    "prose": prose, "signals": dict(rt.signals)}
+        rt.emit("brief_numbers", "pass", f"{len(tool_numbers)} numbers equal the verified tool numbers; "
+                                         "no digits in the prose")
+        facts = {"ticker": ticker, "strategy": parts["proposal"].get("strategy"), "expiry": parts["proposal"].get("expiry"),
+                 "numbers": tool_numbers, "verifier_verdict": (state.get("verifier") or {}).get("verdict"),
+                 "cautions": (state.get("verifier") or {}).get("cautions", []),
+                 "landmine_verdict": (state.get("research") or {}).get("verdict"),
+                 "citations": (state.get("research") or {}).get("citations", [])}
+        if G.disabled("judge"):
+            verdict_j = {"flags": [], "status": "off", "note": "judge switched off (ablation)"}
+        else:
+            verdict_j = judge_brief(prose, facts, rt.llm, rt.masker)
+        rt.emit("judge", "flag" if verdict_j["flags"] or verdict_j["status"] == "malformed" else "pass",
+                verdict_j["note"],
+                signal="judge_flag" if verdict_j["flags"] else None, data=verdict_j["flags"][:5] or None)
+        signals = {**rt.signals, "verifier_cautions": len((state.get("verifier") or {}).get("cautions", [])),
+                   "landmine_caution": int((state.get("research") or {}).get("verdict") == Verdict.CAUTION.value)}
+        if G.sandboxed():   # evaluation: everything except the brief itself
+            return {"brief_id": None, "prose": prose, "judge": verdict_j, "signals": signals,
+                    "budgets": _sync(state, rt)}
         ex = rt.explorer
         tot_result = _FakeResult(ex)
         brief_id = make_brief(AgentResult(state["run_id"], "accepted", prose), rt.box, rt.db, date.fromisoformat(state["as_of"]),
                               extra={"planner": "multi_agent", "tot_run_id": ex.run_id,
                                      "alternatives": alternatives(tot_result), "research": state.get("research"),
                                      "critic_rounds": state.get("critic_rounds", 0),
-                                     "chosen": state.get("chosen"), "verifier_gate": state.get("verifier")})
-        return {"brief_id": brief_id, "budgets": _sync(state, rt),
+                                     "chosen": state.get("chosen"), "verifier_gate": state.get("verifier"),
+                                     "signals": signals, "judge": verdict_j,
+                                     "confidence": (state.get("confidence") or {}).get("landmine")})
+        return {"brief_id": brief_id, "budgets": _sync(state, rt), "prose": prose, "judge": verdict_j,
+                "signals": signals,
                 "messages": _msg(state, "brief_writer", "owner", "one-way", {"brief_id": brief_id})}
 
     def learner(state: AgentState) -> dict:
         from ..briefs import reflect_on_failures
         from ..reflexion import write_lesson
         lesson = None
+        if G.sandboxed():   # evaluation: no lesson is written
+            return {"lesson": None, "budgets": _sync(state, rt),
+                    "messages": _msg(state, "learner", "memory", "one-way", {"lesson": False, "sandbox": True})}
         if rt.box.submissions and any(not r.passed for _, r in rt.box.submissions):
             lesson = reflect_on_failures(rt.box, rt.llm, rt.store, rt.masker)
         else:
@@ -397,6 +482,132 @@ def make_nodes(rt: Runtime) -> dict[str, Callable[[AgentState], dict]]:
 
     return {"supervisor": supervisor, "researcher": researcher, "strategist": strategist, "risk_critic": risk_critic,
             "verifier_gate": verifier_gate, "brief_writer": brief_writer, "learner": learner}
+
+
+CRITIC_CONFIDENCE = ("\nFor every review also give \"confidence\": your probability, from 0 to 1, that the "
+                     "action is right for that candidate.")
+
+
+def _research_events(rt: Runtime, attempts: list[dict], verdict: str) -> None:
+    """pre-stage events of the researcher: coverage guard, grader and rewrite."""
+    first = attempts[0]
+    cov = first.get("coverage") or {}
+    if G.disabled("coverage_guard") and not first["coverage_ok"]:
+        rt.emit("coverage_guard", "flag", f"switched off (ablation); coverage had failed: {cov.get('reason')}")
+    elif first["coverage_ok"]:
+        rt.emit("coverage_guard", "pass", str(cov.get("reason") or "coverage ok"))
+    elif first.get("coverage") is None:
+        rt.emit("coverage_guard", "pass", f"the source reported no coverage figures (verdict {first['verdict']})")
+    else:
+        rt.emit("coverage_guard", "block", f"INSUFFICIENT_EVIDENCE before any LLM call: {cov.get('reason')}")
+    graded = [a for a in attempts if a["graded"]]
+    if G.disabled("grader_rewrite"):
+        rt.emit("grader_rewrite", "flag", "switched off (ablation)")
+    elif not graded:
+        rt.emit("grader_rewrite", "flag", "the grader could not grade the excerpts; no rewrite")
+    else:
+        rel = [a["relevant"] for a in graded]
+        zero = all(r == 0 for r in rel) and any(a["coverage_ok"] for a in graded)
+        why = (f"relevant excerpts per attempt: {rel}; {len(attempts) - 1} rewrite(s); final verdict {verdict}")
+        if zero:
+            rt.emit("grader_rewrite", "flag", "the grader found 0 relevant passages on every attempt, yet coverage "
+                                              f"passed ({why})", signal="grader_zero_relevant")
+        else:
+            rt.emit("grader_rewrite", "pass", why)
+
+
+def _landmine_confidence_gate(rt: Runtime, conf: dict, verdict: str | None) -> None:
+    """during-stage: the landmine verdict's confidence. It can only add the low_confidence signal."""
+    if G.disabled("confidence_gate"):
+        rt.emit("confidence_gate", "pass", "switched off (ablation)")
+        return
+    if not conf.get("llm_asked"):
+        rt.emit("confidence_gate", "pass", f"LLM not asked; the verdict ({verdict}) came from a rule")
+        return
+    m = rt.pb["guardrails.min_confidence"]
+    worst = None
+    for label in ("verbal", "p_true"):
+        decision, reason = G.confidence_gate(conf.get(label), m)
+        if decision == "flag":
+            worst = f"landmine {label}: {reason}"
+            break
+    if worst:
+        rt.emit("confidence_gate", "flag", worst, signal="low_confidence",
+                data={"verbal": conf.get("verbal"), "p_true": conf.get("p_true")})
+    else:
+        rt.emit("confidence_gate", "pass", f"landmine confidence verbal {conf.get('verbal')}, "
+                                           f"P(True) {conf.get('p_true')} ({conf.get('p_true_method')})")
+
+
+def _critic_events(rt: Runtime, ex: Explorer, leaves: list[Node], raw: Any, notes: list[str]) -> None:
+    """during-stage: lower-only rule, citation check and confidence gate for one critic round."""
+    ignored = [x for x in notes if x.startswith("ignored")]
+    if any(x.startswith("critic failed") for x in notes):
+        rt.emit("critic_lower_only", "flag", notes[0][:200])
+        return
+    rt.emit("critic_lower_only", "block" if ignored else "pass",
+            "; ".join(ignored)[:300] if ignored else "every critic action was keep, lower or veto with a cite")
+    reviews = [r for r in (raw or {}).get("reviews", []) if isinstance(r, dict)] if isinstance(raw, dict) else []
+    by_id = {n.id: n for n in leaves}
+    applied = [r for r in reviews if str(r.get("node_id")) in by_id
+               and by_id[str(r.get("node_id"))].detail.get("critic", {}).get("cite") == r.get("cite")]
+    for r in applied:
+        try:
+            by_id[str(r["node_id"])].detail["critic"]["confidence"] = float(r.get("confidence"))
+        except (TypeError, ValueError):
+            by_id[str(r["node_id"])].detail["critic"]["confidence"] = None
+    verdicts = {n.id: {c.name: c.verdict.value for c in ex.results[n.id][1].checks}
+                for n in leaves if n.id in ex.results}
+    problems = G.critic_citation_problems(applied, verdicts, len(rt.box.lessons_used))
+    if problems:
+        rt.emit("critic_citation", "flag", "; ".join(problems)[:300], signal="critic_citation_unsupported")
+    else:
+        rt.emit("critic_citation", "pass", f"{len([r for r in applied if r.get('action') != 'keep'])} "
+                                           "critic citation(s) checked")
+    acted = [r for r in applied if r.get("action") in ("lower_minor", "lower_major", "veto")]
+    if G.disabled("confidence_gate") or not acted:
+        return
+    m = rt.pb["guardrails.min_confidence"]
+    low = [(r["node_id"], reason) for r in acted
+           if (d := G.confidence_gate(r.get("confidence"), m))[0] == "flag" for reason in [d[1]]]
+    if low:
+        rt.emit("confidence_gate", "flag", "critic " + "; ".join(f"{i}: {x}" for i, x in low)[:280],
+                signal="low_confidence")
+    else:
+        rt.emit("confidence_gate", "pass", f"{len(acted)} critic action(s) at or above {m}")
+
+
+def _gate_events(rt: Runtime, state: AgentState, exhausted_why: str | None, ver: dict | None,
+                 chosen: dict | None, result) -> None:
+    """during-stage budgets, then the post-stage verifier, event-date and citation checks."""
+    if exhausted_why:
+        rt.emit("budgets", "flag", str(exhausted_why), signal="budget_exhausted")
+    else:
+        rt.emit("budgets", "pass", f"within budgets: {rt.llm_calls} LLM calls, {rt.builds} builds")
+    if ver is None:
+        rt.emit("verifier", "pass", "no candidate reached the gate")
+    elif chosen:
+        rt.emit("verifier", "pass", f"gate re-verified {chosen['path']}: {ver.get('verdict')}",
+                data={"cautions": ver.get("cautions", [])})
+    else:
+        rt.emit("verifier", "block", (result.reasons[0] if result and result.reasons else "gate rejected")[:300])
+    ew = None
+    if chosen and rt.box.accepted is not None:
+        ew = next((c for c in rt.box.accepted[1].checks if c.name == "event_window"), None)
+    if ew is None:
+        rt.emit("event_date_check", "pass", "no trade to check against event dates")
+    else:
+        dec = "block" if ew.verdict is Verdict.BLOCK else "pass"
+        rt.emit("event_date_check", dec, ew.reason[:300])
+    attempts = getattr(rt, "landmine_attempts", [])
+    dropped = [n for a in attempts for n in a.get("guard_notes", []) if "dropped citations" in n]
+    cites = [c for a in attempts for c in a.get("citations", [])]
+    bad = [c for c in cites if not (c.get("url") and c.get("form") and c.get("date"))]
+    if dropped or bad:
+        rt.emit("citation_from_metadata", "block", "; ".join(dropped)[:200] + (f"; {len(bad)} citation(s) without "
+                                                                               "metadata removed" if bad else ""))
+    else:
+        rt.emit("citation_from_metadata", "pass", f"{len(cites)} citation(s), all from stored chunk metadata")
 
 
 class _FakeResult:
@@ -465,6 +676,9 @@ def _span(rt: Runtime, name: str, fn: Callable[[AgentState], dict]) -> Callable[
         span_id = f"s{len(rt.spans) + 1}-{secrets.token_hex(2)}"
         parent = rt.session_span if name == "supervisor" else (rt.last_supervisor_span or rt.session_span)
         start, t0, calls0, err = _now(), time.monotonic(), rt.llm_calls, None
+        tokens0, fb0 = rt.tokens, rt.fallbacks
+        if rt.guard is not None:
+            rt.guard.span_id = span_id
         try:
             out = fn(state)
         except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
@@ -487,12 +701,39 @@ def _span(rt: Runtime, name: str, fn: Callable[[AgentState], dict]) -> Callable[
                    "ended_at": _now(), "duration_ms": int((time.monotonic() - t0) * 1000),
                    "llm_calls": rt.llm_calls - calls0, "input_summary": rt.masker.value(summary_in),
                    "output_summary": rt.masker.value(summary_out), "error": err}
-            rt.spans.append(row)
-            rt.db.add_span(rt.db_run_id, **row)
+            decision, confidence, cites = _cognitive(name, out)
+            extra = {"tokens": rt.tokens - tokens0, "fallbacks": rt.fallbacks - fb0, "decision": decision,
+                     "confidence": confidence, "ticker": rt.box.ticker, "as_of": state.get("as_of"),
+                     "citations": rt.masker.value(cites) if cites else None}
+            rt.spans.append({**row, **extra})
+            rt.db.add_span(rt.db_run_id, **row, **extra)
+            if rt.guard is not None:
+                rt.guard.span_id = None
             if name == "supervisor":
                 rt.last_supervisor_span = span_id
         return out
     return wrapped
+
+
+def _cognitive(name: str, out: dict | None) -> tuple[str | None, float | None, list | None]:
+    """(decision, confidence, citations) a node produced, for the span's cognitive fields."""
+    if not out:
+        return None, None, None
+    if name == "supervisor":
+        return out["route_log"][-1], None, None
+    if name == "researcher":
+        r = out.get("research") or {}
+        c = (out.get("confidence") or {}).get("landmine") or {}
+        vals = [v for v in (c.get("verbal"), c.get("p_true")) if isinstance(v, (int, float))]
+        return r.get("verdict"), (min(vals) if vals else None), r.get("citations") or None
+    if name == "verifier_gate":
+        return out.get("outcome"), None, None
+    if name == "brief_writer":
+        j = out.get("judge") or {}
+        return (f"judge {len(j.get('flags', []))} flag(s)" if j else None), None, None
+    if name == "risk_critic":
+        return f"round {out.get('critic_rounds')}: revise {len(out.get('revise', []))}", None, None
+    return None, None, None
 
 
 def build_graph(rt: Runtime):

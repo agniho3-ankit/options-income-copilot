@@ -22,6 +22,7 @@ class LLMResponse:
     model: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     eval_tokens: int = 0
+    logprobs: list[dict[str, Any]] | None = None   # Ollama token logprobs, when asked for
 
 
 class LLMClient(Protocol):
@@ -46,7 +47,10 @@ class OllamaClient:
         self._session = session
         self.name = f"ollama:{model}"
 
-    def payload(self, messages, json_schema=None, tools=None) -> dict[str, Any]:
+    supports_logprobs = True
+
+    def payload(self, messages, json_schema=None, tools=None, top_logprobs: int | None = None,
+                max_tokens: int | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"model": self.model, "messages": messages, "stream": False,
                                 "think": self.think,
                                 "options": {"temperature": self.temperature, "num_ctx": self.num_ctx}}
@@ -54,12 +58,18 @@ class OllamaClient:
             body["format"] = json_schema
         if tools:
             body["tools"] = tools
+        if top_logprobs:
+            body["logprobs"], body["top_logprobs"] = True, int(top_logprobs)
+        if max_tokens:
+            body["options"]["num_predict"] = int(max_tokens)
         return body
 
-    def chat(self, messages, *, json_schema=None, tools=None) -> LLMResponse:
+    def chat(self, messages, *, json_schema=None, tools=None, top_logprobs: int | None = None,
+             max_tokens: int | None = None) -> LLMResponse:
         self._session = _session(self._session)
         try:
-            resp = self._session.post(self.url, json=self.payload(messages, json_schema, tools),
+            resp = self._session.post(self.url, json=self.payload(messages, json_schema, tools, top_logprobs,
+                                                                  max_tokens),
                                       timeout=self.timeout)
         except Exception as exc:
             raise LLMError(f"Ollama unreachable: {type(exc).__name__}") from None
@@ -68,7 +78,7 @@ class OllamaClient:
         body = resp.json()
         msg = body.get("message", {})
         return LLMResponse(msg.get("content", ""), self.name, msg.get("tool_calls") or [],
-                           int(body.get("eval_count") or 0))
+                           int(body.get("eval_count") or 0), body.get("logprobs"))
 
 
 class AnthropicClient:
@@ -120,14 +130,20 @@ class FallbackClient:
     def __init__(self, primary: LLMClient, fallback: LLMClient | None = None):
         self.primary, self.fallback = primary, fallback
         self.name = primary.name + (f" (fallback {fallback.name})" if fallback else "")
+        self.fallbacks = 0   # calls answered by the fallback (observability)
+        self.supports_logprobs = bool(getattr(primary, "supports_logprobs", False))
 
-    def chat(self, messages, *, json_schema=None, tools=None) -> LLMResponse:
+    def chat(self, messages, *, json_schema=None, tools=None, top_logprobs: int | None = None,
+             max_tokens: int | None = None) -> LLMResponse:
+        extra = ({"top_logprobs": top_logprobs, "max_tokens": max_tokens}
+                 if self.supports_logprobs and (top_logprobs or max_tokens) else {})
         try:
-            return self.primary.chat(messages, json_schema=json_schema, tools=tools)
+            return self.primary.chat(messages, json_schema=json_schema, tools=tools, **extra)
         except LLMError as first:
             if self.fallback is None:
                 raise
             try:
+                self.fallbacks += 1
                 return self.fallback.chat(messages, json_schema=json_schema, tools=tools)
             except LLMError as second:
                 raise LLMError(f"{first}; fallback failed too: {second}") from None

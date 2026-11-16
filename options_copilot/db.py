@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .guardrails import forbid_in_sandbox
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY, kind TEXT NOT NULL, ticker TEXT, started_at TEXT NOT NULL,
@@ -54,6 +56,14 @@ CREATE TABLE IF NOT EXISTS spans (
     pattern TEXT, started_at TEXT NOT NULL, ended_at TEXT, duration_ms INTEGER, llm_calls INTEGER DEFAULT 0,
     input_summary TEXT, output_summary TEXT, error TEXT, PRIMARY KEY (run_id, span_id)
 );
+CREATE TABLE IF NOT EXISTS guardrail_events (
+    run_id TEXT NOT NULL REFERENCES runs(run_id), seq INTEGER NOT NULL, span_id TEXT, guardrail TEXT NOT NULL,
+    stage TEXT NOT NULL, kind TEXT NOT NULL, decision TEXT NOT NULL, signal TEXT, reason TEXT, data TEXT,
+    created_at TEXT NOT NULL, PRIMARY KEY (run_id, seq)
+);
+CREATE TABLE IF NOT EXISTS evals (
+    eval_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, mode TEXT NOT NULL, summary TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS iv_history (
     ticker TEXT NOT NULL, as_of TEXT NOT NULL, atm_iv REAL NOT NULL, expiry TEXT, dte INTEGER,
     created_at TEXT NOT NULL, PRIMARY KEY (ticker, as_of)
@@ -78,6 +88,22 @@ class Database:
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    # columns added after a table first shipped (ALTER TABLE keeps existing rows)
+    MIGRATIONS = {
+        "spans": {"tokens": "INTEGER DEFAULT 0", "fallbacks": "INTEGER DEFAULT 0", "decision": "TEXT",
+                  "confidence": "REAL", "ticker": "TEXT", "as_of": "TEXT", "citations": "TEXT"},
+        "briefs": {"decision_code": "TEXT", "deferred_at": "TEXT"},
+    }
+
+    def _migrate(self) -> None:
+        with self.conn:
+            for table, cols in self.MIGRATIONS.items():
+                have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                for col, decl in cols.items():
+                    if col not in have:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -129,6 +155,7 @@ class Database:
     # briefs and tickets
     def save_brief(self, brief_id: str, run_id: str | None, kind: str, ticker: str, status: str,
                    verdict: str | None, payload: dict) -> None:
+        forbid_in_sandbox("writing a brief or ticket")
         with self.conn:
             self.conn.execute("INSERT INTO briefs (brief_id, run_id, kind, ticker, status, verdict, created_at, "
                               "payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -144,19 +171,30 @@ class Database:
         return out
 
     def briefs(self, status: str | None = None) -> list[dict]:
-        q, args = "SELECT brief_id, kind, ticker, status, verdict, created_at, decided_at FROM briefs", ()
+        q, args = ("SELECT brief_id, run_id, kind, ticker, status, verdict, created_at, decided_at, decision_code, "
+                   "deferred_at FROM briefs"), ()
         if status:
             q, args = q + " WHERE status = ?", (status,)
         return [dict(r) for r in self.conn.execute(q + " ORDER BY created_at DESC", args)]
 
-    def decide(self, brief_id: str, status: str, reason: str) -> None:
+    def decide(self, brief_id: str, status: str, reason: str, code: str | None = None) -> None:
         with self.conn:
-            cur = self.conn.execute("UPDATE briefs SET status = ?, decided_at = ?, decision_reason = ? "
-                                    "WHERE brief_id = ? AND status = 'pending'", (status, now(), reason, brief_id))
+            cur = self.conn.execute("UPDATE briefs SET status = ?, decided_at = ?, decision_reason = ?, "
+                                    "decision_code = ? WHERE brief_id = ? AND status = 'pending'",
+                                    (status, now(), reason, code, brief_id))
+            if cur.rowcount != 1:
+                raise ValueError(f"brief {brief_id} is not pending")
+
+    def defer(self, brief_id: str) -> None:
+        """Keep a brief pending but move it to the end of the review queue (no decision is made)."""
+        with self.conn:
+            cur = self.conn.execute("UPDATE briefs SET deferred_at = ? WHERE brief_id = ? AND status = 'pending'",
+                                    (now(), brief_id))
             if cur.rowcount != 1:
                 raise ValueError(f"brief {brief_id} is not pending")
 
     def add_ticket(self, brief_id: str, payload: dict) -> str:
+        forbid_in_sandbox("writing a brief or ticket")
         ticket_id = new_id("tkt")
         with self.conn:
             self.conn.execute("INSERT INTO tickets VALUES (?, ?, ?, ?, ?)",
@@ -217,12 +255,46 @@ class Database:
     # spans: one per node execution of a multi-agent run (summaries are masked by the caller)
     def add_span(self, run_id: str, span_id: str, parent_id: str | None, agent: str, pattern: str | None,
                  started_at: str, ended_at: str, duration_ms: int, llm_calls: int, input_summary: Any,
-                 output_summary: Any, error: str | None = None) -> None:
+                 output_summary: Any, error: str | None = None, *, tokens: int = 0, fallbacks: int = 0,
+                 decision: str | None = None, confidence: float | None = None, ticker: str | None = None,
+                 as_of: str | None = None, citations: Any = None) -> None:
+        """Operational (duration, LLM calls, tokens, fallbacks, error), cognitive (decision,
+        confidence; guardrail events link by span_id) and contextual (ticker, as_of, masked
+        summaries, citations) fields of one span."""
         enc = lambda v: v if v is None or isinstance(v, str) else json.dumps(v, default=str)  # noqa: E731
         with self.conn:
-            self.conn.execute("INSERT INTO spans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                              (run_id, span_id, parent_id, agent, pattern, started_at, ended_at, duration_ms,
-                               llm_calls, enc(input_summary), enc(output_summary), error))
+            self.conn.execute(
+                "INSERT INTO spans (run_id, span_id, parent_id, agent, pattern, started_at, ended_at, duration_ms, "
+                "llm_calls, input_summary, output_summary, error, tokens, fallbacks, decision, confidence, ticker, "
+                "as_of, citations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, span_id, parent_id, agent, pattern, started_at, ended_at, duration_ms, llm_calls,
+                 enc(input_summary), enc(output_summary), error, tokens, fallbacks, decision, confidence,
+                 ticker, as_of, enc(citations)))
+
+    # guardrail decisions (one row per decision, linked to the span that was running)
+    def add_guardrail_event(self, run_id: str, seq: int, span_id: str | None, guardrail: str, stage: str, kind: str,
+                            decision: str, signal: str | None, reason: str, data: Any = None) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO guardrail_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (run_id, seq, span_id, guardrail, stage, kind, decision, signal, reason,
+                               None if data is None else json.dumps(data, default=str), now()))
+
+    def guardrail_events(self, run_id: str) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM guardrail_events WHERE run_id = ? ORDER BY seq", (run_id,))
+        return [dict(r) for r in rows]
+
+    # evaluation summaries (the eval harness writes one row per eval or ablation run)
+    def add_eval(self, mode: str, summary: dict) -> str:
+        eval_id = new_id("eval")
+        with self.conn:
+            self.conn.execute("INSERT INTO evals VALUES (?, ?, ?, ?)",
+                              (eval_id, now(), mode, json.dumps(summary, default=str)))
+        return eval_id
+
+    def latest_eval(self, mode: str = "eval") -> dict | None:
+        row = self.conn.execute("SELECT * FROM evals WHERE mode = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                                (mode,)).fetchone()
+        return {**dict(row), "summary": json.loads(row["summary"])} if row else None
 
     def spans(self, run_id: str) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM spans WHERE run_id = ? ORDER BY started_at, rowid", (run_id,))

@@ -48,6 +48,9 @@ def filings_view(lm: dict) -> dict:
     excerpts (wrapped as untrusted data)."""
     return {"verdict": lm["verdict"], "query": lm.get("query"), "citations": lm.get("citations", []),
             "coverage": lm.get("coverage"), "event_dates": lm.get("event_dates", []),
+            "llm_verdict": lm.get("llm_verdict"), "confidence": lm.get("confidence"), "p_true": lm.get("p_true"),
+            "p_true_method": lm.get("p_true_method"), "guard_notes": lm.get("guard_notes", []),
+            "llm_asked": lm.get("llm_verdict") is not None or "llm_error" in lm,
             "reasons": wrap_data(" ".join(lm.get("reasons", []))) if lm.get("reasons") else None,
             "evidence": [{**{k: e[k] for k in ("id", "form", "date", "item", "score") if k in e},
                           "excerpt": wrap_data(e.get("excerpt", ""))} for e in lm.get("evidence", [])]}

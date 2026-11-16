@@ -13,6 +13,7 @@ filing can trigger an action.
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import date
 from typing import Any
@@ -49,7 +50,11 @@ Rules:
 - Headlines alone can justify CAUTION, never BLOCK.
 - Routine quarterly results are not a landmine by themselves. Earnings dates are checked elsewhere.
 - Do not compute prices or probabilities.
-- Reply only with JSON: {"verdict": ..., "reasons": [short strings], "cited_ids": [...]}."""
+- Also give "confidence": your probability, from 0 to 1, that your verdict is correct.
+- Reply only with JSON: {"verdict": ..., "reasons": [short strings], "cited_ids": [...], "confidence": ...}."""
+
+P_TRUE_PROMPT = ("Consider only the documents above. Is the proposed verdict {verdict} correct for this "
+                 "trade? Answer with exactly one word: True or False.")
 
 NO_RAG_NOTE = ("No documents were retrieved for this question. Answer from what you already know "
                "about the company.")
@@ -60,8 +65,9 @@ VERDICT_SCHEMA: dict[str, Any] = {
         "verdict": {"type": "string", "enum": [v.value for v in Verdict]},
         "reasons": {"type": "array", "items": {"type": "string"}},
         "cited_ids": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number"},
     },
-    "required": ["verdict", "reasons", "cited_ids"],
+    "required": ["verdict", "reasons", "cited_ids", "confidence"],
 }
 
 _DELIM = re.compile(r"<<<|>>>")
@@ -111,6 +117,60 @@ def parse_reply(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def verbal_confidence(raw: dict[str, Any] | None) -> float | None:
+    """The model's stated confidence, or None if missing or not a number in 0..1."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        c = float(raw.get("confidence"))
+    except (TypeError, ValueError):
+        return None
+    return round(c, 4) if 0.0 <= c <= 1.0 else None
+
+
+def p_true_from_reply(content: str, logprobs: list[dict] | None) -> tuple[float | None, str]:
+    """P(True) self-evaluation (Kadavath et al. 2022). With token logprobs: the probability mass of
+    True vs False on the first answer token. Without them: the answer itself (1 or 0), marked
+    'answer_only'. Anything unparseable returns None (the caller escalates)."""
+    if logprobs:
+        first = logprobs[0]
+        cands = list(first.get("top_logprobs") or []) or [first]
+        mass = {"true": 0.0, "false": 0.0}
+        for c in cands:
+            tok = str(c.get("token", "")).strip().strip(".").lower()
+            if tok in mass:
+                try:
+                    mass[tok] += math.exp(float(c.get("logprob")))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+        total = mass["true"] + mass["false"]
+        if total > 0:
+            return round(mass["true"] / total, 4), "logprobs"
+        return None, "logprobs"
+    word = re.sub(r"<think>.*?</think>", "", content or "", flags=re.S).strip().strip(".").lower()
+    if word in ("true", "false"):
+        return (1.0 if word == "true" else 0.0), "answer_only"
+    return None, "answer_only"
+
+
+def self_evaluate(llm: LLMClient, messages: list[dict[str, str]], reply: str, verdict: str) -> dict[str, Any]:
+    """Ask the model whether its own proposed verdict is correct (one short extra call)."""
+    probe = [*messages, {"role": "assistant", "content": reply},
+             {"role": "user", "content": P_TRUE_PROMPT.format(verdict=verdict)}]
+    try:
+        if getattr(llm, "supports_logprobs", False):
+            resp = llm.chat(probe, top_logprobs=10, max_tokens=2)
+        else:
+            resp = llm.chat(probe)
+    except LLMError as exc:
+        return {"p_true": None, "method": "error", "note": f"P(True) call failed: {str(exc)[:80]}"}
+    p, method = p_true_from_reply(resp.content, getattr(resp, "logprobs", None))
+    out = {"p_true": p, "method": method}
+    if p is None:
+        out["note"] = f"P(True) reply was not True or False: {str(resp.content)[:40]!r}"
+    return out
 
 
 def enforce(raw: dict[str, Any] | None, by_id: dict[str, RetrievedChunk],
@@ -170,20 +230,26 @@ def landmine_check(ticker: str, trade_context: str, use_retrieval: bool = True, 
     if use_retrieval:
         if store is None:
             raise ValueError("use_retrieval=True needs a store")
-        retrieval = store.search_filings(ticker, query, as_of)
+        from . import guardrails
+        skip_coverage = guardrails.disabled("coverage_guard")   # ablation sandbox only
+        retrieval = store.search_filings(ticker, query, as_of, ignore_coverage=skip_coverage)
         cov = retrieval.coverage
         result["coverage"] = {"ok": cov.ok, "reason": cov.reason, "candidates": cov.candidates,
                               "passing": cov.passing, "passing_filings": cov.passing_filings,
                               "window": [retrieval.window_start.isoformat(), retrieval.window_end.isoformat()]}
-        if not cov.ok:
+        if skip_coverage and not cov.ok:
+            result["ablation"] = "coverage_guard off: the LLM was asked despite failed coverage"
+        if not cov.ok and not skip_coverage:
             result.update(verdict=Verdict.INSUFFICIENT_EVIDENCE.value, llm_verdict=None,
                           reasons=[f"Coverage check failed: {cov.reason}."], citations=[], lessons=[], event_dates=[],
+                          confidence=None, p_true=None, p_true_method=None,
                           guard_notes=["LLM not asked: too little evidence to judge; escalate to the owner"])
             return result
         lessons = store.search_lessons(ticker, query)
 
     docs, by_id = format_documents(retrieval.chunks if retrieval else [])
     messages = build_messages(ticker, trade_context, docs, format_lessons(lessons))
+    reply = ""
     try:
         reply = llm.chat(messages, json_schema=VERDICT_SCHEMA).content  # no tools offered
         raw = parse_reply(reply)
@@ -193,6 +259,14 @@ def landmine_check(ticker: str, trade_context: str, use_retrieval: bool = True, 
     verdict, proposed, reasons, cited, notes = enforce(raw, by_id, use_retrieval)
     if "llm_error" in result:
         notes = ["LLM unavailable; escalated"]
+    # confidence signals: recorded for the confidence gate and calibration; they never change the verdict
+    result["confidence"] = verbal_confidence(raw)
+    result["p_true"], result["p_true_method"] = None, None
+    if proposed is not None and "llm_error" not in result:
+        pt = self_evaluate(llm, messages, reply, proposed.value)
+        result["p_true"], result["p_true_method"] = pt["p_true"], pt["method"]
+        if pt.get("note"):
+            notes = [*notes, pt["note"]]
     result.update(
         verdict=verdict.value,
         llm_verdict=proposed.value if proposed else None,

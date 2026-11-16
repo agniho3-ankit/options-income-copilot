@@ -186,15 +186,10 @@ def score_expiry(pb: Playbook, expiry: date, as_of: date, earnings: date | None,
     """Deterministic depth-2 score for an expiry: DTE fit to the target, days of clearance before
     earnings, and liquidity where the short strikes sit (median open interest of the strikes whose
     |delta| is inside the playbook's delta bands). Unknown inputs score 0. Weights: tot.expiry_weights."""
-    from .calculators import _delta
     w = pb["tot.expiry_weights"]
     dte, target = (expiry - as_of).days, pb["entry.dte_target"]
     half = max(target - pb["entry.dte_min"], pb["entry.dte_max"] - target, 1)
-    lo = min(pb["builder.short_delta_min"], pb["builder.condor_short_delta_min"])
-    hi = max(pb["builder.short_delta_max"], pb["builder.condor_short_delta_max"])
-    ois = sorted(q.open_interest or 0 for q in quotes
-                 if (d := _delta(q, spot, as_of)) is not None and lo <= abs(d) <= hi)
-    median = (ois[len(ois) // 2] if len(ois) % 2 else (ois[len(ois) // 2 - 1] + ois[len(ois) // 2]) / 2) if ois else 0
+    median = inband_median_oi(pb, as_of, quotes, spot)
     scale = pb["entry.open_interest_min"] * pb["tot.liquidity_oi_multiple"]
     comps = {
         "dte_fit": _clamp(1 - abs(dte - target) / half),
@@ -204,6 +199,20 @@ def score_expiry(pb: Playbook, expiry: date, as_of: date, earnings: date | None,
     }
     comps = {k: round(v, 4) for k, v in comps.items()}
     return round(sum(w[k] * comps[k] for k in comps), 4), comps
+
+
+def inband_median_oi(pb: Playbook, as_of: date, quotes: list, spot: float) -> float:
+    """Median open interest of the quotes whose |delta| is inside the playbook's short-delta bands:
+    where a trade's short strikes would sit. 0 when there are none."""
+    from .calculators import _delta
+    lo = min(pb["builder.short_delta_min"], pb["builder.condor_short_delta_min"])
+    hi = max(pb["builder.short_delta_max"], pb["builder.condor_short_delta_max"])
+    ois = sorted(q.open_interest or 0 for q in quotes
+                 if (d := _delta(q, spot, as_of)) is not None and lo <= abs(d) <= hi)
+    if not ois:
+        return 0
+    mid = len(ois) // 2
+    return ois[mid] if len(ois) % 2 else (ois[mid - 1] + ois[mid]) / 2
 
 
 def allowed_strategies(pb: Playbook, ticker: str, price: float, earnings: date | None,
@@ -388,7 +397,13 @@ class Explorer:
             exps = eligible_expiries(self.box.sources.expiries(self.box.ticker), self.box.as_of,
                                      self.pb["entry.dte_min"], self.pb["entry.dte_max"], self.pb["entry.dte_target"],
                                      earnings if self.pb["entry.earnings.expiry_must_precede"] else None)
-            return [e.isoformat() for e in exps], "no listed expiry inside the DTE window before earnings"
+            if not exps:
+                return [], "no listed expiry inside the DTE window before earnings"
+            liquid, thin = self._liquid(exps)
+            if thin:
+                node.detail["thin_expiries"] = thin
+            return [e.isoformat() for e in liquid], ("every expiry inside the DTE window is too thinly traded "
+                                                     f"(in-band median open interest below {self.pb['entry.open_interest_min']})")
         lo, hi = delta_band(self.pb, Strategy(node.spec.strategy))
         return [lo, hi], ""
 
@@ -488,6 +503,24 @@ class Explorer:
             children.append(child)
         return children
 
+    def _chain(self, expiry: date):
+        if expiry not in self.box._chains:
+            self.box._chains[expiry] = self.box.sources.chain(self.box.ticker, expiry)
+        return self.box._chains[expiry]
+
+    def _liquid(self, exps: list[date]) -> tuple[list[date], list[str]]:
+        """Liquidity floor: an expiry whose in-band median open interest is below the verifier's
+        open-interest minimum is never offered, since its builds would fail that check anyway."""
+        d, floor = self.box._data(), self.pb["entry.open_interest_min"]
+        liquid, thin = [], []
+        for e in exps:
+            med = inband_median_oi(self.pb, self.box.as_of, self._chain(e)[0] or [], d.profile.price)
+            if med >= floor:
+                liquid.append(e)
+            else:
+                thin.append(f"{e.isoformat()}: in-band median open interest {med:g} below {floor}")
+        return liquid, thin
+
     def _score_expiry(self, node: Node) -> None:
         expiry = date.fromisoformat(node.spec.expiry)
         if expiry not in self.box._chains:
@@ -498,6 +531,10 @@ class Explorer:
             self.pb, expiry, self.box.as_of, d.profile.earnings_date, quotes, d.profile.price)
         if not quotes:
             node.prune(f"no option quotes listed for {expiry}")
+            return
+        med = inband_median_oi(self.pb, self.box.as_of, quotes, d.profile.price)
+        if med < self.pb["entry.open_interest_min"]:   # defense in depth: the floor also applies here
+            node.prune(f"thin expiry: in-band median open interest {med:g} below {self.pb['entry.open_interest_min']}")
 
     def evaluate(self, node: Node) -> None:
         """Deterministic critic for one leaf: build -> compute -> verify, then score."""

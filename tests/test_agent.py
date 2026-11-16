@@ -87,7 +87,7 @@ def test_with_rag_cites_real_metadata_and_offers_no_tools(loaded):
     assert all(c["url"].startswith("https://example.com/") for c in out["citations"])
     assert any("C7" in n for n in out["guard_notes"])
     call = llm.calls[0]
-    assert call["tools"] is None and call["schema"]["required"] == ["verdict", "reasons", "cited_ids"]
+    assert call["tools"] is None and call["schema"]["required"] == ["verdict", "reasons", "cited_ids", "confidence"]
     user = call["messages"][1]["content"]
     assert "<<<DOC id=C1" in user and "<<<END DOC>>>" in user
 

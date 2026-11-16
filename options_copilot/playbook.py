@@ -143,6 +143,14 @@ SPEC: dict[str, Rule] = {
     "multi_agent.min_relevant_chunks": Rule(int, 1, 20),
     "multi_agent.max_query_rewrites": Rule(int, 0, 1),
     "multi_agent.agent_max_iter": Rule(int, 1, 10),
+    "guardrails.min_confidence": Rule(NUM, 0, 1),
+    "guardrails.review.max_verifier_cautions": Rule(int, 1, 20),
+    **{f"guardrails.review.weights.{s}": Rule(int, 0, 10) for s in (
+        "verifier_cautions", "landmine_caution", "low_confidence", "grader_zero_relevant",
+        "critic_citation_unsupported", "judge_flag", "budget_exhausted", "revisions_all_duplicates")},
+    "guardrails.review.tiers.look_closely_at": Rule(int, 1, 100),
+    "guardrails.review.tiers.escalated_at": Rule(int, 1, 100),
+    "guardrails.reject_codes": Rule(list),
 }
 
 
@@ -209,6 +217,12 @@ def _check_consistency(v: dict[str, Any]) -> list[str]:
     if abs(tot_weights - 1) > 1e-9:
         errors.append(f"tot.weights must sum to 1, got {tot_weights:g}")
     less("tot.critic_penalty.major", "tot.critic_penalty.minor", strict=False)
+    less("guardrails.review.tiers.look_closely_at", "guardrails.review.tiers.escalated_at")
+    codes = v["guardrails.reject_codes"]
+    if len(set(codes)) != len(codes) or "other" not in codes:
+        errors.append("guardrails.reject_codes must be unique and include 'other'")
+    if any(c != c.lower() or " " in c for c in codes):
+        errors.append("guardrails.reject_codes must be lower_snake_case")
     if v["tot.sr_distance_full_scale_pct"] <= 0:
         errors.append("tot.sr_distance_full_scale_pct must be above 0")
 

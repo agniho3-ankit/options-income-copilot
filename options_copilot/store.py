@@ -113,12 +113,15 @@ class RetrievalResult:
 # --- Chroma wrapper -----------------------------------------------------------------------
 
 class Store:
-    def __init__(self, path: Path, embedding_function: Any = None, cfg: RetrievalConfig = RetrievalConfig()):
+    def __init__(self, path: Path | None, embedding_function: Any = None, cfg: RetrievalConfig = RetrievalConfig(),
+                 client: Any = None):
+        """`path` opens the persistent index; `client` (with path None) injects another Chroma
+        client, such as the in-memory one an evaluation snapshot is replayed into."""
         import chromadb
         from chromadb.config import Settings as ChromaSettings
 
         self.cfg = cfg
-        self._client = chromadb.PersistentClient(
+        self._client = client if client is not None else chromadb.PersistentClient(
             path=str(path), settings=ChromaSettings(anonymized_telemetry=False))
         if embedding_function is None:  # all-MiniLM-L6-v2 via ONNX, downloaded once on first use
             from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
@@ -145,7 +148,9 @@ class Store:
                                limit=1, include=[])
         return bool(got["ids"])
 
-    def search_filings(self, ticker: str, query: str, as_of: date) -> RetrievalResult:
+    def search_filings(self, ticker: str, query: str, as_of: date, ignore_coverage: bool = False) -> RetrievalResult:
+        """`ignore_coverage` exists only for the guardrail ablation study (evaluation sandbox):
+        it still reports the failed coverage but selects chunks as if every candidate passed."""
         cfg = self.cfg
         start = as_of - timedelta(days=cfg.window_days)
         window = f"the {cfg.window_days}-day window {start.isoformat()} to {as_of.isoformat()}"
@@ -154,7 +159,13 @@ class Store:
                           {"filed_date": {"$lte": yyyymmdd(as_of)}}]}
         candidates, query_emb = self._query(self.filings, query, where, cfg.fetch_k)
         coverage = assess_coverage(candidates, cfg, window)
-        picked = select(query_emb, candidates, cfg) if coverage.ok else []
+        if coverage.ok:
+            picked = select(query_emb, candidates, cfg)
+        elif ignore_coverage and candidates:
+            from dataclasses import replace
+            picked = select(query_emb, candidates, replace(cfg, min_similarity=-1.0))
+        else:
+            picked = []
         return RetrievalResult([_to_retrieved(c) for c in picked], coverage, start, as_of)
 
     def list_filings(self, ticker: str) -> list[dict[str, Any]]:
@@ -170,6 +181,8 @@ class Store:
 
     # reflections
     def add_reflection(self, r: Reflection) -> str:
+        from .guardrails import forbid_in_sandbox
+        forbid_in_sandbox("writing a lesson")
         if not r.lesson.strip():
             raise ValueError("lesson text is empty")
         rid = "lesson:" + hashlib.sha256(f"{r.ticker}|{r.lesson}".encode()).hexdigest()[:16]

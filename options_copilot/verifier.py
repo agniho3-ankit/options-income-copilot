@@ -278,7 +278,22 @@ def verify(p: TradeProposal, f: MarketFacts, pb: Playbook, numbers: TradeNumbers
     if target is not None:
         checks.insert(9, target)
     checks += advisory(p, f, pb)
-    return VerifierResult(tuple(checks), pb.sha256)
+    return VerifierResult(_ablate(tuple(checks)), pb.sha256)
+
+
+def _ablate(checks: tuple[CheckResult, ...]) -> tuple[CheckResult, ...]:
+    """Guardrail ablation (evaluation sandbox only; guardrails.run_config refuses it elsewhere):
+    with event_date_check off the event-window check reports CLEAR; with the verifier off every
+    failing check reports CLEAR. Both are marked in the reason."""
+    from . import guardrails
+    if not guardrails.sandboxed():
+        return checks
+    out = []
+    for c in checks:
+        off = (guardrails.disabled("verifier") and c.verdict in (B, I)) or \
+              (guardrails.disabled("event_date_check") and c.name == "event_window" and c.verdict is not OK)
+        out.append(replace(c, verdict=OK, reason=f"[ablation: off] {c.reason}") if off else c)
+    return tuple(out)
 
 
 def with_veto(result: VerifierResult, reason: str, block: bool = True) -> VerifierResult:

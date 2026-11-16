@@ -16,6 +16,11 @@ demo_outputs/
 *.pkl
 *.onnx
 
+# --- Evaluation: the owner's labels and frozen snapshots (data/eval_snapshots/) stay local ---
+*.local.yaml
+*.local.yml
+eval_snapshots/
+
 # --- Course material and private documents (belong in the parent folder) ---
 *.docx
 *.pdf

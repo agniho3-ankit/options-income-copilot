@@ -53,10 +53,17 @@ class AgentState(TypedDict, total=False):
     messages: list[dict]         # {from, to, pattern, summary}
     errors: list[str]
     route_log: list[str]
+    # Phase 6: guardrail signals (counts), confidence, the judge, and the evaluation sandbox
+    signals: dict[str, int]
+    confidence: dict
+    prose: str | None
+    judge: dict | None
+    sandbox: bool
+    disabled: list[str]
 
 
 def new_state(run_id: str, ticker: str, as_of: str, cfg: dict, started_at: float | None = None,
-              critic_enabled: bool = True) -> AgentState:
+              critic_enabled: bool = True, sandbox: bool = False, disabled: list[str] | None = None) -> AgentState:
     return AgentState(
         run_id=run_id, ticker=ticker.upper(), as_of=as_of, research=None, tot_run_id=None, strategist_done=False,
         candidates=[], pending_review=[], revise=[], critic_feedback="", critic_rounds=0,
@@ -66,7 +73,8 @@ def new_state(run_id: str, ticker: str, as_of: str, cfg: dict, started_at: float
                         started_at=time.time() if started_at is None else started_at,
                         max_llm_calls=cfg["max_llm_calls"], max_builds=cfg["max_builds"],
                         max_critic_rounds=cfg["max_critic_rounds"], max_wall_seconds=cfg["max_wall_seconds"]),
-        messages=[], errors=[], route_log=[])
+        messages=[], errors=[], route_log=[], signals={}, confidence={}, prose=None, judge=None,
+        sandbox=sandbox, disabled=sorted(disabled or []))
 
 
 def to_json(state: AgentState) -> str:

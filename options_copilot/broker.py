@@ -32,6 +32,8 @@ class Fill:
 
 class PaperBroker:
     def __init__(self, db: Database, sources: Any, as_of: date, *, llm=None, store=None, masker=None):
+        from .guardrails import forbid_in_sandbox
+        forbid_in_sandbox("using the PaperBroker")
         self.db, self.sources, self.as_of = db, sources, as_of
         self.llm, self.store, self.masker = llm, store, masker
         self.last_lesson = None

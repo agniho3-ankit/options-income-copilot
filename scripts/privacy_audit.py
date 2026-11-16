@@ -117,6 +117,10 @@ def check_path(rel: str, denylist: list[str]) -> list[Finding]:
         findings.append(Finding(rel, 0, f"forbidden file type {p.suffix.lower()}"))
     if p.parts and p.parts[0] in FORBIDDEN_DIRS:
         findings.append(Finding(rel, 0, f"file under {p.parts[0]}/ (local data only)"))
+    if p.name.endswith((".local.yaml", ".local.yml")):
+        findings.append(Finding(rel, 0, "owner-local file (labels or settings)"))
+    if "eval_snapshots" in p.parts:
+        findings.append(Finding(rel, 0, "evaluation snapshot (local data only)"))
     low = rel.lower()
     for idx, entry in enumerate(denylist, start=1):
         if entry.lower() in low:

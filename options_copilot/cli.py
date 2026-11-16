@@ -825,8 +825,10 @@ def cmd_reject(args: argparse.Namespace) -> int:
     from .mask import Masker
     settings = load_settings()
     try:
+        pb = load_playbook(settings.playbook_path)
         lesson = reject(_db(settings), args.brief_id, args.reason, llm=build_llm(settings), store=_store(settings),
-                        masker=Masker(settings.synthetic_portfolio_value))
+                        masker=Masker(settings.synthetic_portfolio_value), code=args.code,
+                        codes=tuple(pb["guardrails.reject_codes"]))
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -843,7 +845,7 @@ def cmd_trace(args: argparse.Namespace) -> int:
     print(json.dumps(run, indent=2))
     spans = db.spans(args.run_id)
     if spans and not args.full:
-        print(_render_spans(spans))
+        print(_render_spans(spans, db.guardrail_events(args.run_id)))
         print("(use --full for every prompt, reply and tool call)")
         return 0
     for row in db.trace(args.run_id):
@@ -852,12 +854,16 @@ def cmd_trace(args: argparse.Namespace) -> int:
     return 0
 
 
-def _render_spans(spans: list[dict]) -> str:
-    """Indented span timeline: session > supervisor > the agent it routed to."""
+def _render_spans(spans: list[dict], events: list[dict] | None = None) -> str:
+    """Indented span timeline: session > supervisor > the agent it routed to, with each guardrail
+    decision shown under the span that was running when it was made."""
     from datetime import datetime
     kids: dict[str | None, list[dict]] = {}
     for s in spans:
         kids.setdefault(s["parent_id"], []).append(s)
+    by_span: dict[str, list[dict]] = {}
+    for e in events or []:
+        by_span.setdefault(e["span_id"], []).append(e)
     t0 = next((datetime.fromisoformat(s["started_at"]) for s in spans if s["started_at"]), None)
     lines = [f"{'offset':>8} {'ms':>7}  span"]
 
@@ -867,6 +873,10 @@ def _render_spans(spans: list[dict]) -> str:
         out = s.get("output_summary") or ""
         lines.append(f"{off:>8} {s['duration_ms'] or 0:>7}  {'  ' * depth}{s['agent']:<14}[{s['pattern'] or '-'}]"
                      f"  llm {s['llm_calls'] or 0}  {out[:90]}" + (f"  ERROR {s['error']}" if s.get("error") else ""))
+        for e in by_span.get(s["span_id"], []):
+            mark = {"pass": "ok", "flag": "FLAG", "block": "BLOCK"}[e["decision"]]
+            lines.append(f"{'':>17}{'  ' * (depth + 1)}guardrail {e['stage']:<6} {e['guardrail']:<22} {mark:<5}"
+                         + (f" [{e['signal']}]" if e.get("signal") else "") + f" {e['reason'][:80]}")
         for k in kids.get(s["span_id"], []):
             walk(k, depth + 1)
 
@@ -925,7 +935,7 @@ def _render_ma(r, db) -> str:
         lines.append(f"reason: {why}")
     for e in s.get("errors", [])[:6]:
         lines.append(f"note: {e}")
-    lines += ["", "spans:", _render_spans(db.spans(r.run_id))]
+    lines += ["", "spans:", _render_spans(db.spans(r.run_id), db.guardrail_events(r.run_id))]
     if s.get("brief_id"):
         lines += ["", _render_brief(db.brief(s["brief_id"])),
                   f"\nApprove with: copilot approve {s['brief_id']}   or reject with: copilot reject {s['brief_id']} "
@@ -1014,6 +1024,130 @@ def cmd_ma_compare(args: argparse.Namespace) -> int:
     if args.save:
         _save(settings, f"ma_compare_{shared.ticker}_{as_of}", {"rows": rows, "ma_state": ma.state,
               "ma_spans": db.spans(ma.run_id)}, text)
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    from .review import queue, render_queue, render_view
+    settings = load_settings()
+    pb, db = load_playbook(settings.playbook_path), _db(settings)
+    try:
+        text = render_view(db, pb, args.brief_id) if args.brief_id else render_queue(queue(db, pb))
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(text)
+    if args.save:
+        _save(settings, f"review_{args.brief_id or 'queue'}_{date.today()}",
+              queue(db, pb) if not args.brief_id else {"brief_id": args.brief_id, "view": text}, text)
+    return 0
+
+
+def cmd_defer(args: argparse.Namespace) -> int:
+    db = _db(load_settings())
+    try:
+        db.defer(args.brief_id)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(f"deferred {args.brief_id}: still pending, moved to the end of the review queue (nothing approved)")
+    return 0
+
+
+def cmd_metrics(args: argparse.Namespace) -> int:
+    from .observability import metrics, render
+    settings = load_settings()
+    if args.eval_db:   # the sandboxed eval and ablation runs live in their own database
+        from .db import Database
+        from .eval_harness import SNAPSHOT_ROOT
+        db = Database(settings.repo_root / SNAPSHOT_ROOT / "eval.db")
+    else:
+        db = _db(settings)
+    m = metrics(db, load_playbook(settings.playbook_path), args.since)
+    text = render(m)
+    if args.eval_db:
+        text = text.replace("== Metrics", "== Metrics of the eval database", 1)
+    print(text)
+    if args.save:
+        _save(settings, f"metrics_{'eval_db_' if args.eval_db else ''}{date.today()}"
+              + (f"_since_{args.since}" if args.since else ""), m, text)
+    return 0
+
+
+def _eval_parts(settings):
+    from .db import Database
+    from .eval_harness import SNAPSHOT_ROOT, Harness, SnapshotSources, load_snapshot, snapshot_store
+    from .llm import build_llm
+    from .mask import Masker
+    from .multi_agent import privacy  # noqa: F401 - telemetry off before the frameworks load
+    pb = load_playbook(settings.playbook_path)
+    llm = build_llm(settings, num_ctx=16384)
+    root = settings.repo_root / SNAPSHOT_ROOT
+    eval_db = Database(root / "eval.db")   # never the owner's main database
+
+    def make_sources(case):
+        snap = load_snapshot(case.get("snapshot", case["id"]), root)
+        if snap.ticker != case["ticker"].upper():
+            raise ValueError(f"snapshot {snap.meta['case']} is {snap.ticker}, case says {case['ticker']}")
+        st = snapshot_store(snap, _store_cfg())
+        return SnapshotSources(snap, st, llm), snap.as_of, snap.meta.get("iv_history", [])
+
+    h = Harness(make_sources, llm, eval_db, pb, Masker(settings.synthetic_portfolio_value),
+                settings.synthetic_portfolio_value, log=lambda m: print(m, flush=True))
+    return h, pb, llm
+
+
+def _store_cfg():
+    from .config import RetrievalConfig
+    return RetrievalConfig()
+
+
+def cmd_eval_snapshot(args: argparse.Namespace) -> int:
+    from .eval_harness import SNAPSHOT_ROOT, capture_snapshot
+    from .market import Market
+    from .tools import LiveSources
+    settings = load_settings()
+    pb = load_playbook(settings.playbook_path)
+    as_of = _as_of(args)
+    store = _store(settings)
+    src = LiveSources(pb, as_of, Market(), _edgar_or_none(settings), store, None)
+    out = capture_snapshot(args.case_id, args.ticker, as_of, live_sources=src, store=store, db=_db(settings), pb=pb,
+                           root=settings.repo_root / SNAPSHOT_ROOT)
+    meta = json.loads((out / "meta.json").read_text())
+    print(f"snapshot {args.case_id}: {meta['ticker']} as of {meta['as_of']}, {meta['chains']} chains, "
+          f"{meta['chunks']} filing chunks, {meta['lessons']} lessons -> data/eval_snapshots/{args.case_id}/")
+    return 0
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    from .eval_harness import CaseError, judge_eval, load_cases, render_ablation, render_eval
+    from .mask import Masker
+    settings = load_settings()
+    try:
+        cases, judges = load_cases(settings.repo_root / args.cases)
+    except CaseError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    if args.only:
+        cases = [c for c in cases if c["id"] in set(args.only)]
+    h, pb, llm = _eval_parts(settings)
+    main_db = _db(settings)
+    if args.ablation:
+        res = h.ablation(cases)
+        text = render_ablation(res)
+        main_db.add_eval("ablation", {"rows": [{k: v for k, v in r.items() if k != "records"} for r in res["rows"]]})
+        name = f"eval_ablation_{date.today()}"
+    else:
+        res = h.evaluate(cases, repeats=args.repeats)
+        if judges:
+            res["judge"] = judge_eval(judges, main_db, llm, Masker(settings.synthetic_portfolio_value))
+        text = render_eval(res)
+        main_db.add_eval("eval", {**res["summary"]["aggregate"], "calibration": res["summary"]["calibration"],
+                                  "judge": (res.get("judge") or {}).get("accuracy")})
+        name = f"eval_{date.today()}_x{args.repeats}"
+    print(text)
+    if args.save:
+        _save(settings, name, res, text)
     return 0
 
 
@@ -1182,10 +1316,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_approve)
 
-    p = sub.add_parser("reject", help="reject a pending brief; the reason becomes a lesson")
+    p = sub.add_parser("reject", help="reject a pending brief; the reason (and code) becomes a lesson")
     p.add_argument("brief_id")
     p.add_argument("--reason", required=True)
+    p.add_argument("--code", help="reason code from playbook guardrails.reject_codes")
     p.set_defaults(func=cmd_reject)
+
+    p = sub.add_parser("defer", help="keep a pending brief pending but move it to the end of the review queue")
+    p.add_argument("brief_id")
+    p.set_defaults(func=cmd_defer)
+
+    p = sub.add_parser("review", help="ranked review queue, or one brief on one screen (approval stays manual)")
+    p.add_argument("brief_id", nargs="?")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("metrics", help="local observability summary from SQLite (no exporters)")
+    p.add_argument("--since", help="YYYY-MM-DD")
+    p.add_argument("--eval-db", action="store_true", help="summarize the sandboxed eval/ablation runs instead")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_metrics)
+
+    p = sub.add_parser("eval-snapshot", help="freeze one eval case's inputs (run during market hours)")
+    p.add_argument("case_id")
+    p.add_argument("ticker")
+    p.add_argument("--as-of")
+    p.set_defaults(func=cmd_eval_snapshot)
+
+    p = sub.add_parser("eval", help="evaluate the multi-agent pipeline on your labeled cases (sandboxed)")
+    p.add_argument("--cases", default="eval/cases.local.yaml")
+    p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--ablation", action="store_true", help="switch one guardrail off at a time")
+    p.add_argument("--only", nargs="+", help="case ids to run")
+    p.add_argument("--save", action="store_true")
+    p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser("trace", help="print the masked trace of an agent run")
     p.add_argument("run_id")

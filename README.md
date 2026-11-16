@@ -260,10 +260,17 @@ on this laptop; score is the deterministic `tot.weights` score after any critic)
 | META | budget exhausted, 14 calls, 123 s | SELECTED call spread 695/715, 0.7235, 9 calls, 172 s | SELECTED a safer call spread 710/730, 0.5219, 1 critic round, 14 calls, 312 s |
 | NVDA | no_trade, 14 calls, 195 s | NO_TRADE (no expiry inside the DTE window before earnings), 1 call, 19 s | NO_TRADE, same reason, 3 calls, 46 s, lesson written |
 
-**Where the multi-agent version helped.** On META the critic sent three expiries back and the team
-chose a further out-of-the-money spread than single ToT: a more conservative trade, not just a
-lower score. The researcher's rewrite (MSFT) adds a second retrieval at the cost of one LLM call.
-Every hand-off is a span, so `trace RUN_ID` shows who decided what.
+**Where the multi-agent version helped, and where it only looked like it.** On META the team
+chose a different spread than single ToT (710/730 instead of 695/715), but not because of the
+critic. The `tot_nodes` rows show the critic lowered all seven priced leaves by the same ×0.7
+(`lower_major`, all citing `lesson:3` with the same generic reason), so the ranking did not
+change, and all nine revision proposals it triggered were rejected as repeats. The pick changed
+because the CrewAI Strategist proposed a 0.22 delta for the call spread, which single ToT never
+tried (it tried 0.25, 0.28 and 0.30). That is the generator exploring differently, not the critic
+adding judgment. On MSFT the researcher's rewrite cost one LLM call and changed nothing: the grader
+found 0 relevant passages both before and after the rewrite, and the verdict stayed CLEAR. What
+the multi-agent version does add is traceability: every hand-off is a span, so `trace RUN_ID`
+shows who decided what.
 
 **Where it did not help.** It is about 1.8 to 2 times slower than single ToT and never safer than
 the gate: the safety guarantees come from the deterministic verifier either way, and on NVDA the
@@ -272,6 +279,212 @@ qwen3:8b the CrewAI Strategist first echoed the JSON schema instead of answering
 fell back to the enumerator) until the task showed an example object instead. The Risk Critic's
 citations can be loose (it cited a check that had passed); that is harmless only because Python
 lets it lower, never raise.
+
+## Evaluation, guardrails, human review and observability (Phase 6, Module 6)
+
+```bash
+python -m options_copilot.cli review                     # ranked queue of pending briefs (approval stays manual)
+python -m options_copilot.cli review BRIEF_ID            # one brief on one screen, with three ready commands
+python -m options_copilot.cli reject BRIEF_ID --code event_risk --reason "8-K event before expiry"
+python -m options_copilot.cli defer BRIEF_ID             # stays pending, moves to the end of the queue
+python -m options_copilot.cli metrics --since 2026-11-01 --save   # add --eval-db for the eval runs
+python -m options_copilot.cli eval-snapshot CASE_ID TICKER   # freeze one case's inputs (market hours)
+python -m options_copilot.cli eval --repeats 3 --save        # labeled cases, HELM-style metrics
+python -m options_copilot.cli eval --ablation --save         # one guardrail off at a time (sandboxed)
+```
+
+The failures this app has actually shown, and what catches each one, are in
+[docs/FAILURE_MODES.md](docs/FAILURE_MODES.md). The MAESTRO seven-layer threat map is in
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+
+**One guardrail pipeline.** `options_copilot/guardrails.py` keeps one registry of every guardrail,
+each with a stage and a kind. The checks themselves are unchanged and stay where they were; the
+pipeline names them and writes every decision (`pass`, `flag` or `block`, with a reason) to a
+`guardrail_events` table linked to the span that was running. `trace RUN_ID` shows the events
+inline under their spans.
+
+| Stage | Guardrail | Kind | What it does |
+|---|---|---|---|
+| pre | `coverage_guard` | static | too little filing evidence returns INSUFFICIENT_EVIDENCE before any LLM call |
+| pre | `grader_rewrite` | runtime | relevance grade and at most one query rewrite; 0 relevant raises `grader_zero_relevant` |
+| pre | `playbook_bands` | static | candidates outside the playbook strategies, DTE window or delta bands are rejected |
+| during | `budgets` | static | LLM-call, build, critic-round and wall-clock caps end the run |
+| during | `critic_lower_only` | static | the critic may keep, lower or veto; anything else is ignored |
+| during | `critic_citation` | runtime | flags a cited check that passed, a missing lesson, or one reason pasted on every candidate |
+| during | `confidence_gate` | risk score | confidence below `guardrails.min_confidence` (0.6) raises `low_confidence` |
+| post | `verifier` | static | the deterministic verifier and the gate's re-verify; final |
+| post | `event_date_check` | static | Python compares cited event dates with the expiry |
+| post | `citation_from_metadata` | static | citations rebuilt from stored chunk metadata; invented IDs dropped |
+| post | `brief_numbers` | static | brief numbers must equal the verified tool numbers, or no brief is written |
+| post | `judge` | risk score | LLM-as-judge lists unsupported or contradicted claims; flag only |
+
+**Why the order matters.** The coverage guard runs before any LLM call, so a model never gets the
+chance to judge filings that are not there: missing evidence stops the run instead of being
+reasoned around. The playbook bands run before a build, so nothing out of policy is priced. The
+budgets and the lower-only critic run while the search is still going, so a loop or a generous
+critic cannot rescue a candidate. The verifier runs before the brief, so the prose is always
+written about a trade that already passed, and the judge runs last because it can only add a
+flag. A test checks that each run's events go pre, then during, then post.
+
+**Signals add caution, never remove it.** Every Phase 6 signal (`low_confidence`,
+`grader_zero_relevant`, `critic_citation_unsupported`, `judge_flag`, `budget_exhausted`,
+`revisions_all_duplicates`) only raises a brief's place in the review queue. None changes a
+verdict, raises a score, or approves anything. Tests pin this for each signal.
+
+**Confidence and calibration.** The landmine LLM now returns a verbalized `confidence` with its
+verdict. A second short call asks whether its proposed verdict is correct (P(True), Kadavath et al.
+2022). The installed Ollama returns token logprobs, so P(True) is the probability mass of the
+`True` token against `False` on the first answer token; with the Claude fallback, which has no
+logprobs here, the answer itself counts as 1 or 0 and is marked `answer_only`. A missing or
+unparseable value escalates as `low_confidence`. The Risk Critic also gives a confidence for each
+action; a low-confidence lowering still applies (it is extra caution) and raises the signal.
+`eval` measures calibration as ECE and the Brier score, with a reliability table that shows the
+count in every bin. With a few labeled cases the numbers are indicative only.
+
+**LLM-as-judge.** `options_copilot/judge.py` gives the brief's prose and the code-filled facts
+(numbers, verifier verdict, cautions, landmine verdict, citations) to the model and asks for every
+claim the facts do not support or that contradicts them. It can only flag: an empty list adds
+nothing, and a malformed reply is recorded as such. The deterministic number check stays the hard
+check. Limit: the judge is the same qwen3:8b that writes the prose, so it may prefer its own
+wording (self-preference). Its accuracy is measured against the owner's faithful and unfaithful
+labels in `eval`.
+
+**Evaluation harness.** Cases live in `eval/cases.local.yaml` (gitignored). Each points at real
+past runs and holds the owner's label: the expected landmine verdict, whether a trade is
+acceptable or the right outcome is NO_TRADE or BLOCK, and optionally the acceptable strategies.
+`eval` refuses a case without a label. `eval-snapshot` freezes each case's inputs during market
+hours into `data/eval_snapshots/` (gitignored): ticker data, expiries and chains, the ticker's
+in-window filing chunks with their embeddings copied from the local Chroma, and the lessons. A
+replay rebuilds an in-memory Chroma from the snapshot, so everything except LLM sampling is
+identical. Eval runs use the multi-agent graph (the only pipeline with every guardrail), its own
+database, and a sandbox in which creating a brief, a ticket, a broker call or a lesson raises an
+error. Reported per case and overall:
+
+- **accuracy:** landmine verdict and outcome against the label;
+- **safety:** unsafe trades passed (a trade selected where the label says none; must be 0) and the
+  false-block rate;
+- **calibration:** ECE, Brier and the reliability table for verbal confidence and P(True);
+- **robustness:** verdict and outcome consistency across `--repeats`, plus one fixed paraphrased
+  query per case;
+- **efficiency:** latency p50/p95, LLM calls, builds, Claude fallbacks;
+- **judge accuracy:** judge flags against the owner's labels.
+
+Committed tests use synthetic fixtures with known answers only.
+
+**Ablation.** `eval --ablation` reruns the cases with one guardrail off at a time: the coverage
+guard, the grader and rewrite, the critic, the event-date check, the confidence gate, the judge,
+and (only in this mode) the verifier. Switching a guardrail off is refused outside the sandbox. The
+table reports unsafe trades passed, how many of those the review queue would show at the standard
+tier, false blocks, accuracy, LLM calls and latency per configuration.
+
+**Review queue.** Every trade still needs the owner's approval; there is no auto-approve at any
+tier. `review` ranks pending briefs by a deterministic risk score (weights in `playbook.yaml`
+under `guardrails.review`):
+
+| Signal | Points |
+|---|---|
+| verifier cautions | 1 each, at most 3 |
+| landmine CAUTION | 2 |
+| `low_confidence` | 2 |
+| `grader_zero_relevant` | 2 |
+| `critic_citation_unsupported` | 1 |
+| `judge_flag` | 3 |
+| `budget_exhausted` | 2 |
+| `revisions_all_duplicates` | 1 |
+
+A score of 0-1 is `standard`, 2-3 `look_closely`, and 4 or more `escalated`. BLOCK and
+INSUFFICIENT_EVIDENCE runs appear as info items with the reason and the next step. `review
+BRIEF_ID` fits on one screen: the trade and its numbers, the verifier verdict and cautions, the
+top three signals in plain words, citations, the alternatives considered, and three ready
+commands (approve, reject with a code, defer).
+
+**Feedback loop.** `reject --code` takes a code from `guardrails.reject_codes` (`event_risk`,
+`too_close_to_resistance`, `low_credit`, `bad_citation`, `other`) as well as the free-text
+reason. The code is stored on the brief and as a tag on the lesson. `metrics` counts the codes and
+notes when one keeps repeating, as a hint about which prompt or guardrail to tighten. It never
+changes the playbook.
+
+**Observability.** Each span now carries operational data (latency, LLM calls, tokens, Claude
+fallbacks, errors), cognitive data (the decision, the confidence, and the linked guardrail events)
+and contextual data (ticker, as-of date, masked input and output summaries, citations).
+`metrics` reads only the local SQLite and prints runs by outcome, the review-tier mix, guardrail
+pass/flag/block counts, unsafe trades passed from the latest eval, latency p50/p95 per agent, LLM
+calls per run, Claude fallbacks, errors, reject-code counts, the judge flag rate and the landmine
+confidence distribution. There is no dashboard and no exporter; LangSmith (the course's tracing
+tool) stays off, and the telemetry test still runs.
+
+**Results (2026-11-16, five owner-labeled cases, snapshots frozen at the market open, qwen3:8b).**
+The cases: META with the 8-K recapitalization (labeled CAUTION, a trade acceptable), AAPL with no
+filings (INSUFFICIENT_EVIDENCE), NVDA with earnings the next day (CAUTION, NO_TRADE), MSFT before
+an ex-dividend date (CLEAR, trade), and BAC (CLEAR, trade).
+
+| Eval, 5 cases x 3 repeats | Before the liquidity floor | After |
+|---|---|---|
+| unsafe trades passed | **0** | **0** |
+| false blocks (of 9 "trade" runs) | 9 | **0** |
+| outcome accuracy | 0.40 | **1.00** |
+| landmine verdict accuracy | 0.93 | 0.93 |
+| verdict / outcome consistency over repeats | 0.93 / 1.00 | 0.93 / 1.00 |
+| paraphrase agreement | 0.60 | 0.80 |
+| latency p50 / p95 | 99 s / 207 s | 156 s / 295 s |
+| LLM calls per run | 7.2 | 10.3 |
+| Claude fallbacks | 0 | 0 |
+
+The first eval found the main failure: every case labeled "trade" ended NO_TRADE. The Strategist
+proposed only thin weekly expiries (META: Dec 24, Dec 31, Jan 15), and the depth-2 expiry score let
+Dec 31 win on DTE fit (0.50 of the weight) with a liquidity component of 0.0015, so every build
+then failed the verifier's open-interest check (500). That failure was safe but useless. The fix is
+a **liquidity floor** that reuses the verifier's own rule: an expiry whose in-band median open
+interest is below `entry.open_interest_min` is never offered to the Strategist and is pruned at
+depth 2 if it appears anyway (a pre-stage `playbook_bands` event). On the same frozen snapshots
+the floor removed all nine false blocks and passed nothing unsafe. The remaining verdict miss is
+BAC, which flips between CLEAR and CAUTION across repeats.
+
+| Ablation (one run per case; before the floor) | unsafe | false blocks | outcome acc | LLM calls/run | p50 |
+|---|---|---|---|---|---|
+| full pipeline | 0 | 3 | 0.4 | 7.2 | 115 s |
+| − coverage guard | 0 | 3 | 0.4 | 7.2 | 110 s |
+| − grader and rewrite | 0 | 3 | 0.4 | 5.0 | 121 s |
+| − critic | 0 | 3 | 0.4 | 7.2 | 118 s |
+| − event-date check | 0 | 3 | 0.4 | 7.2 | 109 s |
+| − confidence gate | 0 | 3 | 0.4 | 7.2 | 105 s |
+| − judge | 0 | 3 | 0.4 | 7.2 | 103 s |
+| − verifier | 0 | 1 | 0.8 | 10.2 | 159 s |
+
+**Which guardrails earned their cost on this data, and which did not.**
+
+- **The verifier earned it.** With it off, META and MSFT selected trades on the Dec 31 expiry with
+  open interest near 3 (the MSFT one a short call through the ex-dividend date). The labels allow a
+  trade on both tickers, so the table even shows outcome accuracy *rising* to 0.8: "unsafe versus
+  the label" does not see an untradeable fill, only the verifier does. NVDA stayed NO_TRADE even
+  without the verifier, because the earnings rule is also enforced when expiries are chosen.
+- **The coverage guard earned it cheaply.** On AAPL, with it off, the next rule (a CLEAR must cite a
+  filing) still returned INSUFFICIENT_EVIDENCE, but only after an LLM call (24 s instead of 5 s).
+- **The grader and rewrite did not, here.** About 2 extra LLM calls per run changed no verdict or
+  outcome. They raised `grader_zero_relevant` on MSFT in every run, which is useful review context
+  but not a decision.
+- **The critic, the event-date check and the confidence gate changed nothing** in these five cases.
+  The event-date check matters only when a cited filing event falls before expiry, which none did.
+- **The confidence gate never fired.** All 57 landmine confidences in 70 runs were 0.8 to 1.0, and
+  **P(True) was 1.0 in every run**: on qwen3:8b the True token takes all the probability mass, so
+  P(True) carries no information here. Verbal confidence averaged 0.89 against 0.92 accuracy (ECE
+  0.025, Brier 0.07, n = 12). That looks well calibrated, but one relabel (NVDA from BLOCK to
+  CAUTION) moved ECE from 0.225 to 0.025, so with 12 points the calibration numbers are indicative
+  only.
+- **The judge did not earn its place as a tier signal yet.** It flagged all 11 briefs it saw. Some
+  flags are real catches: BAC's prose twice said the stock was "not near an ex-dividend date" when
+  the verifier had an ex-dividend caution, and META's prose called discretionary insider sales
+  "insider trading". Most are generic "unsupported" flags on harmless phrasing. With a 100% flag
+  rate, `judge_flag` puts every brief in the escalated tier, so it stops ranking anything. The
+  owner's faithful/unfaithful labels (not yet set) are needed to measure its precision.
+- **Every selected trade was escalated anyway.** Without the judge, META (3 cautions + landmine
+  CAUTION) and MSFT (2 cautions + `grader_zero_relevant` + all-duplicate revisions) still score 5;
+  BAC drops to look_closely. On real tickers the weights put most trades at the top tier, which is
+  conservative but blunts the ranking.
+
+Outputs: `demo_outputs/eval_2026-11-16_x3_before_floor.*`, `eval_2026-11-16_x3.*` (after),
+`eval_ablation_2026-11-16.*`, `review_queue_2026-11-16.*`, `metrics_2026-11-16.*` and
+`metrics_eval_db_2026-11-16_since_2026-11-16.*` (`metrics --eval-db` summarizes the sandboxed runs).
 
 ### How the landmine check decides
 
@@ -317,6 +530,7 @@ Unit tests block network access, and use fake LLM and data clients.
 | 4 | Tree-of-Thought explorer (Module 4) | done |
 | 4 | Journal, PaperBroker, monitor, IV history, end-to-end demo | done |
 | 5 | Multi-agent workflow: LangGraph supervisor, CrewAI roles, MCP server, spans | done |
+| 6 | Guardrail pipeline, confidence and calibration, judge, eval and ablation, review queue, metrics, liquidity floor | done |
 
 ## License
 

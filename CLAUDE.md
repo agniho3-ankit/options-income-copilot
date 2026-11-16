@@ -62,6 +62,10 @@ python -m options_copilot.cli playbook     # validate playbook.yaml
   Phase 4: `tot.py` (Tree-of-Thought explorer, `tot_nodes` table), `events.py` (cited event dates)
   `broker.py` (PaperBroker), `journal.py` (Skill #7 log), `monitor.py` (rules -> decision -> exit/roll
   brief), `sim.py` (simulated clock, demo only), `demo.py` (end-to-end demo)
+  Phase 5: `multi_agent/` (LangGraph supervisor, CrewAI roles), `mcp_server.py`
+  Phase 6: `guardrails.py` (registry, events, sandbox), `judge.py`, `evaluation.py` (metrics),
+  `eval_harness.py` (snapshots, eval, ablation), `review.py` (queue), `observability.py` (`metrics`);
+  `docs/FAILURE_MODES.md`, `docs/THREAT_MODEL.md`
 - `playbook.yaml`: the rules (procedural memory), validated strictly by `playbook.py`
 - `scripts/privacy_audit.py`: stdlib pre-commit privacy scan
 - `tests/`: pytest, network blocked by `conftest.py`

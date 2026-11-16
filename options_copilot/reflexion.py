@@ -58,5 +58,7 @@ def write_lesson(trigger: ReflectionTrigger, ticker: str, facts: dict[str, Any],
     reflection = Reflection(lesson=lesson, trigger=trigger, ticker=ticker.upper(),
                             tags=tags or [trigger.value], synthetic=True)
     if store is not None:
+        from .guardrails import forbid_in_sandbox
+        forbid_in_sandbox("writing a lesson")
         store.add_reflection(reflection)
     return reflection

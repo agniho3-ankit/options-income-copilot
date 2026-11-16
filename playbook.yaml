@@ -8,7 +8,7 @@
 # "Skill #N" refers to the sections of the owner's original written playbook.
 # Educational project only. These are one person's rules, not financial advice.
 
-version: 5
+version: 6
 
 # Decision tree: a new position needs the ticker on Tier 1 or Tier 2.
 # Watch names are screened and briefed but cannot be entered until promoted.
@@ -160,3 +160,24 @@ multi_agent:
   min_relevant_chunks: 2                # Researcher: fewer graded-relevant chunks -> one query rewrite
   max_query_rewrites: 1                 # at most one rewrite (cannot be raised above 1)
   agent_max_iter: 3                     # CrewAI reasoning/tool iterations per task
+
+# Module 6: guardrails, confidence, the review queue and the feedback loop (options_copilot/
+# guardrails.py). Signals here can only add caution or escalation; they never relax a rule,
+# raise a score, or approve a trade. Every trade still needs the owner's approval.
+guardrails:
+  min_confidence: 0.6                   # landmine or critic confidence below this -> low_confidence
+  review:
+    max_verifier_cautions: 3            # verifier cautions counted at most this many times
+    weights:                            # points per signal for the deterministic risk score
+      verifier_cautions: 1              # per CAUTION item
+      landmine_caution: 2
+      low_confidence: 2
+      grader_zero_relevant: 2
+      critic_citation_unsupported: 1
+      judge_flag: 3
+      budget_exhausted: 2
+      revisions_all_duplicates: 1
+    tiers:                              # score 0-1 standard, 2-3 look_closely, 4+ escalated
+      look_closely_at: 2
+      escalated_at: 4
+  reject_codes: [event_risk, too_close_to_resistance, low_credit, bad_citation, other]
