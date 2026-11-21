@@ -139,10 +139,12 @@ describe("Review", () => {
     expect(screen.getByText("$347.50")).toBeInTheDocument();
   });
 
-  it("is read-only in this slice: no approve, reject or defer controls", async () => {
-    mockFetch(routes());
+  it("a decided brief shows the decision and no decision controls", async () => {
+    const decided = { ...BRIEF, brief: { ...BRIEF.brief, status: "rejected", decided_at: "2026-11-20T10:00:00+00:00",
+      decision_code: "event_risk", decision_reason: "deal closes before expiry" } };
+    mockFetch(routes({ "/api/briefs/brf-1": decided }));
     render(<Review id="brf-1" />);
-    await screen.findByText("Credit");
+    expect(await screen.findByText(/Rejected on/)).toHaveTextContent("with code Event risk: deal closes before expiry");
     expect(screen.queryByRole("button", { name: /approve|reject|defer/i })).toBeNull();
   });
 });

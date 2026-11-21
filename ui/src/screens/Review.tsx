@@ -3,29 +3,32 @@
 import { useEffect, useState } from "react";
 import { get, type BriefView, type Evidence, type Numbers, type TradeWindow } from "../lib/api";
 import * as f from "../lib/format";
+import { DecisionBar } from "../components/DecisionBar";
 import { GuardrailStrip } from "../components/GuardrailStrip";
 import { Status, tierStatus, verdictStatus } from "../components/Status";
 import { TradeWindowChart } from "../components/TradeWindowChart";
 
 type Load<T> = { state: "loading" } | { state: "error"; message: string } | { state: "ready"; data: T };
 
-function useLoad<T>(path: string | null): Load<T> {
+function useLoad<T>(path: string | null, version = 0): Load<T> {
   const [load, setLoad] = useState<Load<T>>({ state: "loading" });
   useEffect(() => {
     if (!path) return;
     let live = true;
-    setLoad({ state: "loading" });
+    if (version === 0) setLoad({ state: "loading" });   // a reload after a decision keeps the page up
     get<T>(path)
       .then((data) => live && setLoad({ state: "ready", data }))
       .catch((e: Error) => live && setLoad({ state: "error", message: e.message }));
     return () => { live = false; };
-  }, [path]);
+  }, [path, version]);
   return load;
 }
 
 export function Review({ id }: { id: string | null }) {
   const base = id ? `/api/briefs/${encodeURIComponent(id)}` : null;
-  const brief = useLoad<BriefView>(base);
+  const [version, setVersion] = useState(0);
+  const [message, setMessage] = useState<string | null>(null);
+  const brief = useLoad<BriefView>(base, version);
   const win = useLoad<TradeWindow>(base && `${base}/window`);
   const ev = useLoad<Evidence>(base && `${base}/evidence`);
 
@@ -121,9 +124,18 @@ export function Review({ id }: { id: string | null }) {
         )}
       </section>
 
-      <section className="panel decision-placeholder" aria-label="Decision">
-        <p className="muted">Approve, reject and defer arrive in the next slice. Nothing on this screen changes the brief.</p>
-      </section>
+      {message && <p className="panel decided" role="status">{message}</p>}
+      {b.status === "pending" ? (
+        <DecisionBar view={brief.data} onDecided={(m) => { setMessage(m); setVersion((v) => v + 1); }} />
+      ) : (
+        <section className="panel" aria-label="Decision">
+          <p className="muted">
+            {f.words(b.status)} on <span className="num">{f.date(b.decided_at)}</span>
+            {b.decision_code && <> with code {f.words(b.decision_code)}</>}
+            {b.decision_reason && <>: {b.decision_reason}</>}. This brief can no longer be changed here.
+          </p>
+        </section>
+      )}
     </article>
   );
 }

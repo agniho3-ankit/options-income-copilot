@@ -99,9 +99,12 @@ def test_unsafe_methods_need_token_and_local_origin(client):
     assert client.post("/api/anything", headers={**ORIGIN, "X-CSRF-Token": token}).status_code in (404, 405)
 
 
-def test_slice1_exposes_no_write_routes(client):
-    methods = {m for r in client.app.routes for m in getattr(r, "methods", set())}
-    assert methods <= {"GET", "HEAD"}
+WRITE_ROUTES = {"/api/briefs/{brief_id}/approve", "/api/briefs/{brief_id}/reject", "/api/briefs/{brief_id}/defer"}
+
+
+def test_the_only_write_routes_are_the_three_decisions(client):
+    writes = {r.path for r in client.app.routes if set(getattr(r, "methods", set())) - {"GET", "HEAD"}}
+    assert writes == WRITE_ROUTES
 
 
 def test_no_cdn_docs_and_strict_csp(client):
@@ -287,3 +290,153 @@ def test_fastapi_telemetry_is_fully_off(client):
     cfg = client.app._telemetry
     assert all(cfg[k] is False for k in TELEMETRY_OFF) and cfg["auto_configure"] is False
     assert client.app._native_telemetry.enabled() is False
+
+
+# --- slice 4: decisions ----------------------------------------------------------------------
+
+from pathlib import Path  # noqa: E402
+
+import options_copilot.briefs as briefs_mod  # noqa: E402
+from options_copilot.llm import LLMResponse  # noqa: E402
+
+
+class FakeStore:
+    def __init__(self):
+        self.lessons = []
+
+    def add_reflection(self, r):
+        self.lessons.append(r)
+        return "lesson-id"
+
+
+class FakeLLM:
+    name = "fake"
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, messages, **kw):
+        self.calls += 1
+        return LLMResponse(content="Check event dates against expiry before entering a spread near a filing.", model="fake")
+
+
+def _decide_app(seeded, tmp_path, llm=None, store=None):
+    db, pb, settings, *_ = seeded
+    store = store or FakeStore()
+    app = create_app(settings, pb, main_db=db, outputs_dir=tmp_path, market_factory=lambda: FakeMarket(),
+                     today=lambda: TODAY, llm_factory=lambda: llm, store_factory=lambda: store)
+    c = TestClient(app, base_url=BASE)
+    token = c.get("/api/session").json()["csrf_token"]
+    return c, {**ORIGIN, "X-CSRF-Token": token}, store
+
+
+def _state(db, bid):
+    return db.brief(bid)["status"], len(db.tickets())
+
+
+def test_approve_calls_briefs_approve_once_with_a_valid_token(seeded, tmp_path, monkeypatch):
+    db, *_ = seeded
+    calls = []
+    real = briefs_mod.approve
+    monkeypatch.setattr(briefs_mod, "approve", lambda d, bid, note="": calls.append((bid, note)) or real(d, bid, note))
+    c, h, _ = _decide_app(seeded, tmp_path)
+    r = c.post("/api/briefs/brf-a/approve", json={"brief_id": "brf-a", "ticker": "MSFT", "note": "ok"}, headers=h)
+    assert r.status_code == 200 and r.json()["paper_only"] is True
+    assert calls == [("brf-a", "ok")]
+    t = db.tickets()[-1]
+    assert t["ticket_id"] == r.json()["ticket_id"] and t["payload"]["paper_only"] is True
+    assert _state(db, "brf-a") == ("approved", 1)
+    again = c.post("/api/briefs/brf-a/approve", json={"brief_id": "brf-a", "ticker": "MSFT"}, headers=h)
+    assert again.status_code == 409 and len(db.tickets()) == 1 and len(calls) == 1
+
+
+def test_approve_without_a_valid_token_or_matching_confirmation_changes_nothing(seeded, tmp_path, monkeypatch):
+    db, *_ = seeded
+    calls = []
+    monkeypatch.setattr(briefs_mod, "approve", lambda *a, **k: calls.append(a))
+    c, h, _ = _decide_app(seeded, tmp_path)
+    body = {"brief_id": "brf-a", "ticker": "MSFT"}
+    assert c.post("/api/briefs/brf-a/approve", json=body, headers=ORIGIN).status_code == 403
+    assert c.post("/api/briefs/brf-a/approve", json=body, headers={**ORIGIN, "X-CSRF-Token": "nope"}).status_code == 403
+    assert c.post("/api/briefs/brf-a/approve", json=body,
+                  headers={"Origin": "http://evil.example", "X-CSRF-Token": h["X-CSRF-Token"]}).status_code == 403
+    assert c.post("/api/briefs/brf-a/approve", json={"brief_id": "brf-a", "ticker": "META"}, headers=h).status_code == 400
+    assert c.post("/api/briefs/brf-a/approve", json={"brief_id": "brf-b", "ticker": "MSFT"}, headers=h).status_code == 400
+    assert c.post("/api/briefs/brf-a/approve", json={}, headers=h).status_code == 422
+    assert calls == [] and _state(db, "brf-a") == ("pending", 0)
+
+
+def test_no_other_route_can_approve_or_write_a_ticket(seeded, tmp_path):
+    db, *_ = seeded
+    c, h, _ = _decide_app(seeded, tmp_path)
+    for route in c.app.routes:
+        for method in set(getattr(route, "methods", set())) - {"HEAD"}:
+            if route.path.endswith("/approve"):
+                continue
+            path = route.path.replace("{brief_id}", "brf-a").replace("{run_id}", "run-x").replace("{path:path}", "x")
+            c.request(method, path, json={"brief_id": "brf-a", "ticker": "MSFT", "code": "other",
+                                          "reason": "testing every route", "note": "x"}, headers=h)
+            assert len(db.tickets()) == 0, f"{method} {route.path} wrote a ticket"
+            assert db.brief("brf-a")["status"] != "approved", f"{method} {route.path} approved a brief"
+
+
+def test_only_the_approve_handler_calls_briefs_approve_or_add_ticket():
+    src = Path(__file__).resolve().parent.parent / "options_copilot" / "api"
+    hits = {p.name: p.read_text().count("briefs.approve(") for p in src.glob("*.py")}
+    assert hits["decisions.py"] == 1 and sum(hits.values()) == 1
+    assert all("add_ticket" not in p.read_text() for p in src.glob("*.py"))
+    import re
+    no_bulk = re.compile(r"def \w*(bulk|approve_all|auto_approve)\w*|/approve_all|/bulk", re.I)
+    assert not any(no_bulk.search(p.read_text()) for p in src.glob("*.py"))
+
+
+def test_reject_validates_the_code_and_reason(seeded, tmp_path, monkeypatch):
+    db, pb, *_ = seeded
+    c, h, store = _decide_app(seeded, tmp_path, llm=FakeLLM())
+    assert c.post("/api/briefs/brf-b/reject", json={"code": "made_up", "reason": "x"}, headers=h).status_code == 422
+    assert c.post("/api/briefs/brf-b/reject", json={"code": "event_risk", "reason": "   "}, headers=h).status_code == 422
+    assert c.post("/api/briefs/brf-b/reject", json={"code": "event_risk"}, headers=h).status_code == 422
+    assert c.post("/api/briefs/brf-b/reject", json={"code": "event_risk", "reason": "x"}, headers=ORIGIN).status_code == 403
+    assert db.brief("brf-b")["status"] == "pending" and store.lessons == []
+    r = c.post("/api/briefs/brf-b/reject", json={"code": "event_risk", "reason": "8-K deal closes before expiry"},
+               headers=h)
+    assert r.status_code == 200 and r.json()["lesson_by"] == "local LLM"
+    row = next(x for x in db.briefs() if x["brief_id"] == "brf-b")
+    assert (row["status"], row["decision_code"]) == ("rejected", "event_risk")
+    assert len(store.lessons) == 1 and "code:event_risk" in store.lessons[0].tags
+    assert len(db.tickets()) == 0
+
+
+def test_reject_uses_the_template_lesson_while_a_run_holds_the_llm(seeded, tmp_path):
+    db, *_ = seeded
+    llm = FakeLLM()
+    c, h, store = _decide_app(seeded, tmp_path, llm=llm)
+    st = c.app.state.ui
+    assert st.llm_lock.acquire(blocking=False)
+    try:
+        r = c.post("/api/briefs/brf-c/reject", json={"code": "low_credit", "reason": "credit too thin"}, headers=h)
+    finally:
+        st.llm_lock.release()
+    assert r.status_code == 200 and r.json()["lesson_by"].startswith("template")
+    assert llm.calls == 0 and db.brief("brf-c")["status"] == "rejected" and len(store.lessons) == 1
+
+
+def test_defer_keeps_the_brief_pending_and_moves_it_last(seeded, tmp_path):
+    db, *_ = seeded
+    c, h, _ = _decide_app(seeded, tmp_path)
+    assert c.post("/api/briefs/brf-b/defer", json={"brief_id": "brf-a"}, headers=h).status_code == 400
+    r = c.post("/api/briefs/brf-b/defer", json={"brief_id": "brf-b"}, headers=h)
+    assert r.status_code == 200 and r.json()["status"] == "pending"
+    assert db.brief("brf-b")["status"] == "pending" and len(db.tickets()) == 0
+    order = [i["brief_id"] for i in c.get("/api/queue").json()["trades"]]
+    assert set(order[-2:]) == {"brf-b", "brf-d"}     # both deferred briefs sit at the end
+    assert c.post("/api/briefs/brf-zzz/defer", json={"brief_id": "brf-zzz"}, headers=h).status_code == 404
+
+
+def test_decided_briefs_cannot_be_decided_again(seeded, tmp_path):
+    db, *_ = seeded
+    c, h, _ = _decide_app(seeded, tmp_path, llm=None)
+    assert c.post("/api/briefs/brf-c/reject", json={"code": "other", "reason": "no"}, headers=h).status_code == 200
+    assert c.post("/api/briefs/brf-c/approve", json={"brief_id": "brf-c", "ticker": "BAC"}, headers=h).status_code == 409
+    assert c.post("/api/briefs/brf-c/defer", json={"brief_id": "brf-c"}, headers=h).status_code == 409
+    assert len(db.tickets()) == 0

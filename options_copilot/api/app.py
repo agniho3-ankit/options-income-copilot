@@ -80,6 +80,15 @@ class AppState:
     port: int
     market: MarketCache | None = None
     today: Callable[[], date] = date.today
+    llm_factory: Callable[[], Any] | None = None     # local LLM for reject lessons (no cloud fallback)
+    store_factory: Callable[[], Any] | None = None   # Chroma lesson store
+    llm_lock: threading.Lock = field(default_factory=threading.Lock)   # one LLM job at a time
+    _store: Any = None
+
+    def store(self) -> Any:
+        if self._store is None and self.store_factory is not None:
+            self._store = self.store_factory()
+        return self._store
     csrf_token: str = field(default_factory=new_token)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -98,7 +107,8 @@ class AppState:
 
 def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: Database | None = None,
                outputs_dir: Path | None = None, dist_dir: Path | None = None, port: int = 8765,
-               market_factory: Callable[[], Any] | None = None, today: Callable[[], date] = date.today) -> FastAPI:
+               market_factory: Callable[[], Any] | None = None, today: Callable[[], date] = date.today,
+               llm_factory: Callable[[], Any] | None = None, store_factory: Callable[[], Any] | None = None) -> FastAPI:
     if market_factory is None:
         def market_factory():
             from ..market import Market
@@ -106,7 +116,9 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
     st = AppState(settings=settings, pb=pb, main_db=main_db, eval_db=eval_db,
                   masker=Masker(settings.synthetic_portfolio_value),
                   outputs_dir=outputs_dir or settings.repo_root / "demo_outputs", dist_dir=dist_dir, port=port,
-                  market=MarketCache(market_factory), today=today)
+                  market=MarketCache(market_factory), today=today,
+                  llm_factory=llm_factory or (lambda: _local_llm(settings)),
+                  store_factory=store_factory or (lambda: _chroma_store(settings)))
     # no /docs, /redoc or /openapi.json: the Swagger page pulls assets from a CDN
     # FastAPI's built-in OpenTelemetry instrumentation: every part off, and no exporter is ever added
     app = FastAPI(title="Options Income Copilot (local)", docs_url=None, redoc_url=None, openapi_url=None,
@@ -221,6 +233,10 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
             raise HTTPException(422, str(exc)) from exc
         return out({**w, "freshness": fresh})
 
+    # --- decisions: approve, reject, defer (api/decisions.py; the only state-changing routes) ---
+    from .decisions import register as register_decisions
+    register_decisions(app, st, out)
+
     # --- runs, spans, guardrail events, the ToT tree ------------------------------------------
 
     @app.get("/api/runs")
@@ -318,6 +334,18 @@ def trade_summary(kind: str, p: dict) -> dict:
         new = p["new"].get("proposal") or {}
         out["new"] = {"strategy": new.get("strategy"), "legs": _legs(new.get("legs")), "expiry": new.get("expiry")}
     return out
+
+
+def _local_llm(settings: Settings):
+    """The UI uses the local model only: no cloud fallback, even if a key is configured."""
+    from ..llm import FallbackClient, OllamaClient
+    return FallbackClient(OllamaClient(settings.ollama_url, settings.ollama_model, think=settings.ollama_think,
+                                       temperature=settings.llm_temperature), None)
+
+
+def _chroma_store(settings: Settings):
+    from ..store import Store
+    return Store(settings.chroma_dir)
 
 
 def _thaw(node: Any) -> Any:
