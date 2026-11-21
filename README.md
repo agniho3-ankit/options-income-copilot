@@ -500,6 +500,78 @@ Outputs: `demo_outputs/eval_2026-11-16_x3_before_floor.*`, `eval_2026-11-16_x3.*
    Invented citations are dropped. Citations always come from the stored metadata, never
    from model text.
 
+## UI (local review cockpit)
+
+A local web app over the same Python functions. Its main job is the approval cockpit: the home
+screen is the ranked review queue, and reviewing and deciding on a brief gets the most care. It runs
+on `127.0.0.1` only, with no telemetry, no analytics and nothing loaded from a CDN.
+
+### Run it
+
+```bash
+uv pip install -e ".[ui]"                       # fastapi, uvicorn (pinned)
+(cd ui && npm ci && npm run build)              # React + TypeScript, built into ui/dist
+python -m options_copilot.cli ui                # http://127.0.0.1:8765 on data/copilot.db
+python -m options_copilot.cli ui --db demo      # synthetic data in data/ui_demo.db (built if missing)
+```
+
+For front-end work, run the API with `cli ui` and the Vite dev server with `(cd ui && npm run dev)`
+on `127.0.0.1:5173`; it proxies `/api` to the API. Tests: `pytest -q` and `(cd ui && npm test)`.
+
+### Screens
+
+| Screen | What it shows |
+|---|---|
+| **Today** | The review queue as lanes: escalated, look closely, standard, then info items (BLOCK / INSUFFICIENT_EVIDENCE runs with the reason and the next step), then deferred briefs. Each card shows the trade, the score and the top three signals in plain words. |
+| **Review** | One brief: number tiles from the stored payload, the **trade-window chart** (price history, a ±1σ cone from today to expiry, strikes, profit and loss zones, breakevens, and event pins for earnings, ex-dividend and cited filing dates), the guardrail pipeline strip, why it is escalated, verifier checks, the evidence drawer, judge flags (flag only), alternatives, and the decision bar. |
+| **Explore** | Start a multi-agent or ToT-only run and watch it: a live supervisor timeline (a lane per agent, growing spans, guardrail markers, LLM calls) and the Tree-of-Thought as an icicle (pruned branches with reasons, liquidity withholds, critic lowers, the selected leaf). |
+| **Positions** | Each open paper position as rule tracks (profit toward 50%, DTE toward the 21-day roll, loss toward the 1x-credit stop, the 1σ move, earnings, IV crush, ex-dividend), portfolio heat against the 30% cap, and Run monitor. |
+| **Journal** | The Skill #7 trade log and monthly summaries (P&L, win rate, return on risk, exit rules). |
+| **Lab** | Saved evidence: unsafe trades passed, false blocks, before and after the liquidity floor, the ablation heat table, reliability diagrams, and guardrail, latency and reject-code metrics for `copilot.db` or `eval.db`. |
+| **Playbook** | Read-only: version, sha256, key thresholds and every section. Only the owner edits `playbook.yaml`. |
+
+Keyboard: `J`/`K` move through the queue, `Enter` opens a brief, `A`/`R`/`D` open approve, reject
+and defer (each still confirms), `/` searches tickers, `?` lists the shortcuts.
+
+### Architecture
+
+```
+React (ui/)  ->  FastAPI (options_copilot/api/)  ->  existing functions
+                                                      review.queue, review.brief_signals, guardrails.risk_score,
+                                                      briefs.approve / reject, Database.defer, window.build_window,
+                                                      management.rule_tracks, monitor.snapshot, journal.metrics,
+                                                      observability.metrics, lab.build, run_multi_agent, tot.explore
+```
+
+- **No trading logic in the UI or the API.** Every number, verdict, score, tier, signal, cone,
+  zone and progress value comes from Python. The front end only formats values, and a test fails
+  if a screen or component contains arithmetic.
+- **Long runs are background jobs.** `POST /api/runs` starts a multi-agent, ToT or monitor run; the
+  browser follows it over Server-Sent Events, polled from the run's `spans` and `guardrail_events`
+  (spans are written when a node starts and completed when it ends). Only one LLM job runs at a
+  time. Evaluations are never started from the browser: the Lab shows the command and a warning.
+- **Two databases stay separate**: `data/copilot.db` (your runs) and `data/eval_snapshots/eval.db`
+  (sandboxed eval runs). Read routes take `?db=main|eval`; decisions only touch the main one.
+
+### Safety rules
+
+- **Approval is a deliberate human act.** `POST /api/briefs/{id}/approve` calls `briefs.approve`
+  and nothing else, and only when the request repeats the brief ID and ticker shown in the confirm
+  dialog. The dialog names the ticker, strategy and credit, says "paper ticket", and starts with
+  focus on Cancel. There is no bulk or automatic approval, and tests prove no other route can
+  approve a brief or write a ticket. Keyboard shortcuts open the same confirm steps.
+- **Reject** needs a code from `guardrails.reject_codes` and a reason; **defer** keeps the brief pending.
+- **Paper only, always visible**: a permanent marker in the header.
+- **Local only**: the server refuses any address but `127.0.0.1`, checks the Host header, and
+  requires a per-session CSRF token and a local Origin on every state-changing request. CORS allows
+  only the local dev origin. FastAPI's OpenTelemetry instrumentation and its CDN-backed docs pages
+  are switched off. Fonts (Inter, JetBrains Mono) are bundled.
+- **Masked, secret-free output**: trace content is masked again on the way out, and the SEC
+  User-Agent and API keys are scrubbed from every response.
+- **Retrieved text is data**: filing excerpts render as plain text in a quote block, never as HTML,
+  markdown or links.
+- **The LLM stays local**: UI runs and reject lessons use Ollama only, with no cloud fallback.
+
 ## Tests
 
 ```bash
@@ -531,6 +603,7 @@ Unit tests block network access, and use fake LLM and data clients.
 | 4 | Journal, PaperBroker, monitor, IV history, end-to-end demo | done |
 | 5 | Multi-agent workflow: LangGraph supervisor, CrewAI roles, MCP server, spans | done |
 | 6 | Guardrail pipeline, confidence and calibration, judge, eval and ablation, review queue, metrics, liquidity floor | done |
+| UI | Local review cockpit: FastAPI + React, seven screens, background runs over SSE | done |
 
 ## License
 

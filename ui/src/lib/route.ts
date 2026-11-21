@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 export type Route =
-  | { screen: "today" }
+  | { screen: "today"; filter: string | null }
   | { screen: "review"; id: string | null }
   | { screen: "explore"; id: string | null }
   | { screen: "positions" }
@@ -22,7 +22,7 @@ export function parse(hash: string): Route {
     case "playbook":
       return { screen };
     default:
-      return { screen: "today" };
+      return { screen: "today", filter: screen === "today" && id ? decodeURIComponent(id).toUpperCase() : null };
   }
 }
 

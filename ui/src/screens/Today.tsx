@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { get, type InfoItem, type Queue, type QueueTrade } from "../lib/api";
 import * as f from "../lib/format";
 import { Status, tierStatus, verdictStatus } from "../components/Status";
+import { moveFocus, useShortcuts } from "../lib/keys";
 
 const LANES: { tier: QueueTrade["tier"]; title: string }[] = [
   { tier: "escalated", title: "Escalated" },
@@ -13,8 +14,12 @@ const LANES: { tier: QueueTrade["tier"]; title: string }[] = [
 
 type Load = { state: "loading" } | { state: "error"; message: string } | { state: "ready"; queue: Queue };
 
-export function Today() {
+export function Today({ filter = null }: { filter?: string | null }) {
   const [load, setLoad] = useState<Load>({ state: "loading" });
+  useShortcuts((key) => {
+    if (key === "j" || key === "J") moveFocus("a.card[data-brief]", 1);
+    if (key === "k" || key === "K") moveFocus("a.card[data-brief]", -1);
+  });
   useEffect(() => {
     let live = true;
     get<Queue>("/api/queue")
@@ -27,19 +32,26 @@ export function Today() {
   if (load.state === "error") {
     return <p className="error" role="alert">Could not load the review queue: {load.message}</p>;
   }
-  const { trades, info, heat } = load.queue;
+  const { heat } = load.queue;
+  const match = (t: string) => !filter || t.toUpperCase().startsWith(filter);
+  const trades = load.queue.trades.filter((t) => match(t.ticker));
+  const info = load.queue.info.filter((i) => match(i.ticker));
   const active = trades.filter((t) => !t.deferred);
   const deferred = trades.filter((t) => t.deferred);
 
   return (
     <>
       <h1 className="visually-hidden">Today</h1>
+      {filter && (
+        <p className="filter-note">Showing <span className="num">{filter}</span> only · <a href="#/today">show all</a></p>
+      )}
       <p className="summary" data-testid="summary">
         <strong className="num">{active.length}</strong> to review · <strong className="num">{info.length}</strong> info ·
         portfolio heat <strong className="num">{f.pct(heat.pct)}</strong> of <span className="num">{f.pct(heat.cap_pct, 0)}</span>
       </p>
       {active.length === 0 && info.length === 0 && deferred.length === 0 && (
-        <p className="empty">No pending briefs. Start a run from Explore, or run the monitor from Positions.</p>
+        <p className="empty">{filter ? `No pending brief or info item for ${filter}.`
+          : "No pending briefs. Start a run from Explore, or run the monitor from Positions."}</p>
       )}
       {LANES.map((lane) => {
         const items = active.filter((t) => t.tier === lane.tier);

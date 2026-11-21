@@ -66,6 +66,9 @@ python -m options_copilot.cli playbook     # validate playbook.yaml
   Phase 6: `guardrails.py` (registry, events, sandbox), `judge.py`, `evaluation.py` (metrics),
   `eval_harness.py` (snapshots, eval, ablation), `review.py` (queue), `observability.py` (`metrics`);
   `docs/FAILURE_MODES.md`, `docs/THREAT_MODEL.md`
+  UI: `api/` (FastAPI over the functions above: `app.py`, `security.py`, `decisions.py`, `jobs.py`,
+  `server.py`), `window.py` (trade-window chart data), `lab.py` (saved eval evidence), `ui_demo.py`
+  (synthetic demo DB); `ui/` (React + TypeScript + Vite; `npm test`, `npm run build`)
 - `playbook.yaml`: the rules (procedural memory), validated strictly by `playbook.py`
 - `scripts/privacy_audit.py`: stdlib pre-commit privacy scan
 - `tests/`: pytest, network blocked by `conftest.py`

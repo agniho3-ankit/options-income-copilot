@@ -1359,6 +1359,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ui", help="start the local review cockpit on 127.0.0.1 (paper only)")
     p.add_argument("--host", default="127.0.0.1", help="must be 127.0.0.1; anything else is refused")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--db", choices=("main", "demo"), default="main",
+                   help="demo serves synthetic data from data/ui_demo.db (built if missing)")
+    p.add_argument("--rebuild-demo", action="store_true", help="rebuild data/ui_demo.db before serving")
     p.set_defaults(func=cmd_ui)
     return parser
 
@@ -1367,7 +1370,12 @@ def cmd_ui(args: argparse.Namespace) -> int:
     from .api.security import BindError
     from .api.server import serve
     try:
-        serve(load_settings(), args.host, args.port)
+        if args.rebuild_demo and args.db == "demo":
+            from .api.server import DEMO_DB
+            from .ui_demo import build_demo_db
+            settings = load_settings()
+            build_demo_db(settings.data_dir / DEMO_DB)
+        serve(load_settings(), args.host, args.port, args.db)
     except BindError as exc:
         print(exc, file=sys.stderr)
         return 2

@@ -325,3 +325,19 @@ input.ticker-input { font-family: var(--font-mono); text-transform: uppercase; w
 .pb-tree .pb-tree { margin: 0; padding-left: var(--space-3); border-left: 1px solid var(--line); }
 .guard-table td:last-child { white-space: nowrap; font-size: 12px; }
 .guard-table td { padding: 4px var(--space-2); }
+
+/* skip link, search, shortcut sheet */
+.skip-link { position: absolute; left: var(--space-4); top: -40px; z-index: 100; background: var(--accent); color: var(--accent-ink);
+  padding: var(--space-2) var(--space-3); border-radius: var(--radius); }
+.skip-link:focus { top: var(--space-2); }
+.main:focus { outline: none; }
+.search input { font-family: var(--font-mono); width: 7.5rem; color: var(--text); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 4px 8px; text-transform: uppercase; }
+.search input::placeholder { color: var(--text-muted); text-transform: none; }
+.filter-note { margin: 0 0 var(--space-2); color: var(--text-muted); }
+.shortcut-list { display: grid; gap: 6px; margin: 0 0 var(--space-3); }
+.shortcut-list > div { display: grid; grid-template-columns: 6rem 1fr; gap: var(--space-3); }
+.shortcut-list dd { margin: 0; }
+kbd { font-family: var(--font-mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--line);
+  border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; }
+a.card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }

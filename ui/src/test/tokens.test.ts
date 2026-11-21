@@ -41,3 +41,12 @@ describe.each(Object.entries(themes))("%s theme", (_name, t) => {
     for (const bg of SURFACES) expect(contrast(t.focus, t[bg])).toBeGreaterThanOrEqual(3);
   });
 });
+
+describe("motion", () => {
+  it("the stylesheet switches motion off for reduced-motion users", () => {
+    const base = readFileSync(fileURLToPath(new URL("../styles/base.css", import.meta.url)), "utf8");
+    const block = base.slice(base.indexOf("@media (prefers-reduced-motion: reduce)"));
+    expect(block).toMatch(/animation: none !important/);
+    expect(block).toMatch(/transition: none !important/);
+  });
+});

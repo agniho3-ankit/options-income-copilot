@@ -4,6 +4,7 @@
 import { useCallback, useState } from "react";
 import { post, type BriefView } from "../lib/api";
 import * as f from "../lib/format";
+import { useShortcuts } from "../lib/keys";
 import { Dialog } from "./Dialog";
 
 type Mode = null | "approve" | "reject" | "defer";
@@ -31,6 +32,14 @@ export function DecisionBar({ view, onDecided, initial = null }: {
   const [reason, setReason] = useState("");
   const { brief: b } = view;
   const close = useCallback(() => { if (!busy) setMode(null); }, [busy]);
+  // A, R, D open the same confirm steps as the buttons; they never send anything themselves
+  useShortcuts((key, e) => {
+    const k = key.toLowerCase();
+    if (k === "a" || k === "r" || k === "d") {
+      e.preventDefault();
+      setMode(k === "a" ? "approve" : k === "r" ? "reject" : "defer");
+    }
+  }, !busy);
   const c = confirmText(view);
 
   async function send(path: string, body: unknown, done: (r: Record<string, string>) => string) {
