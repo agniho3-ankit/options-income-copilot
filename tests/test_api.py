@@ -1,0 +1,190 @@
+"""UI API (slice 1): read-only routes, local binding, CSRF, masking. No network, no LLM."""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from options_copilot.api.app import create_app  # noqa: E402
+from options_copilot.api.security import BindError, check_bind  # noqa: E402
+from options_copilot.config import load_settings  # noqa: E402
+from options_copilot.db import Database  # noqa: E402
+from options_copilot.guardrails import risk_score  # noqa: E402
+from options_copilot.playbook import load_playbook  # noqa: E402
+from options_copilot.review import brief_signals, queue as review_queue  # noqa: E402
+
+UA = "Test Copilot tester@example.com"
+BASE = "http://127.0.0.1:8765"
+ORIGIN = {"Origin": BASE}
+
+
+def _payload(credit: float, signals: dict, risks: list[str] | None = None, judge: bool = False) -> dict:
+    return {"proposal": {"ticker": "MSFT", "strategy": "put_credit_spread", "contracts": 1, "expiry": "2027-01-15",
+                         "legs": [{"option_type": "put", "side": "short", "strike": 450.0, "expiry": "2027-01-15"},
+                                  {"option_type": "put", "side": "long", "strike": 440.0, "expiry": "2027-01-15"}]},
+            "numbers": {"credit": credit, "max_loss": 1000 - credit, "breakevens": [446.53], "pop": 0.7712,
+                        "risk_pct_of_portfolio": 0.653, "collateral": 1000 - credit},
+            "signals": signals, "risks": risks or [], "landmine_verdict": "CLEAR",
+            "judge": {"flags": [{"claim": "x", "issue": "unsupported"}]} if judge else {"flags": []},
+            "citations": [{"form": "8-K", "date": "2026-10-28", "item": "Item 8.01", "url": "https://www.sec.gov/x"}]}
+
+
+@pytest.fixture()
+def seeded():
+    db = Database(":memory:")
+    pb = load_playbook(load_settings(env={}).playbook_path)
+    r1 = db.start_run("multi_agent", "MSFT", "fake", pb.sha256)
+    db.save_brief("brf-a", r1, "entry", "MSFT", "pending", "CLEAR", _payload(347.5, {}))
+    db.save_brief("brf-b", None, "entry", "META", "pending", "CAUTION",
+                  _payload(212.0, {"judge_flag": 1, "grader_zero_relevant": 1}, ["insider sales"], judge=True))
+    db.save_brief("brf-c", None, "entry", "BAC", "pending", "CAUTION", _payload(98.25, {}, ["iv rank low"]))
+    db.save_brief("brf-d", None, "entry", "AAPL", "pending", "CLEAR", _payload(150.0, {}))
+    db.defer("brf-d")
+    r2 = db.start_run("multi_agent", "AAPL", "fake", pb.sha256)
+    db.add_guardrail_event(r2, 1, None, "coverage_guard", "pre", "static", "block", None,
+                           "0 of 20 chunks passed")
+    db.finish_run(r2, "INSUFFICIENT_EVIDENCE")
+    # trace content that was (wrongly) stored raw: the API must still mask it and drop the User-Agent
+    db.add_span(r1, "sp1", None, "researcher", "react", "2026-11-19T19:03:12", "2026-11-19T19:04:29", 77125, 3,
+                {"ticker": "MSFT"}, {"note": f"asked EDGAR as {UA}; account 12345678 holds $12,500"})
+    db.add_guardrail_event(r1, 1, "sp1", "judge", "post", "risk_score", "flag", "judge_flag",
+                           f"claim mentions $25,000 and {UA}")
+    db.save_tot_nodes(r1, [{"id": "n1", "parent_id": None, "depth": 1, "status": "kept", "score": 0.4,
+                            "prune_reason": None, "source": "generator", "note": "loss of $40,000"}])
+    db.add_eval("eval", {"unsafe_passed": 0, "false_blocks": 0})
+    settings = load_settings(env={"SEC_USER_AGENT": UA})
+    return db, pb, settings, r1, r2
+
+
+@pytest.fixture()
+def client(seeded, tmp_path):
+    db, pb, settings, *_ = seeded
+    (tmp_path / "eval_2026-11-16_x3.json").write_text(json.dumps({"unsafe_passed": 0}))
+    app = create_app(settings, pb, main_db=db, outputs_dir=tmp_path)
+    return TestClient(app, base_url=BASE)
+
+
+def test_bind_refuses_anything_but_loopback():
+    assert check_bind("127.0.0.1") == "127.0.0.1"
+    for host in ("0.0.0.0", "localhost", "::", "::1", "192.168.1.5", ""):
+        with pytest.raises(BindError):
+            check_bind(host)
+
+
+def test_ui_command_refuses_public_host(capsys):
+    from options_copilot.cli import main
+    assert main(["ui", "--host", "0.0.0.0"]) == 2
+    assert "127.0.0.1 only" in capsys.readouterr().err
+
+
+def test_host_header_must_be_loopback(client):
+    assert client.get("/api/session").status_code == 200
+    r = client.get("/api/session", headers={"Host": "evil.example:8765"})
+    assert r.status_code == 400
+
+
+def test_unsafe_methods_need_token_and_local_origin(client):
+    token = client.get("/api/session").json()["csrf_token"]
+    assert len(token) >= 32
+    # rejected before routing, so even an unknown path never runs without the token
+    assert client.post("/api/anything", headers=ORIGIN).status_code == 403
+    assert client.post("/api/anything", headers={**ORIGIN, "X-CSRF-Token": "wrong"}).status_code == 403
+    assert client.post("/api/anything", headers={"Origin": "http://evil.example", "X-CSRF-Token": token}
+                       ).status_code == 403
+    assert client.post("/api/anything", headers={"X-CSRF-Token": token}).status_code == 403   # no Origin
+    # a valid token from the local origin gets through the guard (and then 404s: no such route)
+    assert client.post("/api/anything", headers={**ORIGIN, "X-CSRF-Token": token}).status_code in (404, 405)
+
+
+def test_slice1_exposes_no_write_routes(client):
+    methods = {m for r in client.app.routes for m in getattr(r, "methods", set())}
+    assert methods <= {"GET", "HEAD"}
+
+
+def test_no_cdn_docs_and_strict_csp(client):
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404
+    csp = client.get("/api/session").headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp and "http" not in csp
+
+
+def test_session_is_paper_only(client):
+    s = client.get("/api/session").json()
+    assert s["paper_only"] is True and s["databases"] == {"main": True, "eval": False}
+
+
+def test_queue_order_matches_review_queue(client, seeded):
+    db, pb, *_ = seeded
+    expected = review_queue(db, pb)
+    got = client.get("/api/queue").json()
+    assert [i["brief_id"] for i in got["trades"]] == [i["brief_id"] for i in expected["trades"]]
+    assert len({i["tier"] for i in got["trades"]}) >= 2      # the fixture spans more than one tier
+    assert got["trades"][-1]["brief_id"] == "brf-d" and got["trades"][-1]["deferred"] is True
+    assert [i["outcome"] for i in got["info"]] == ["INSUFFICIENT_EVIDENCE"]
+    assert got["info"][0]["why"] == "0 of 20 chunks passed"
+    for item, exp in zip(got["trades"], expected["trades"]):
+        assert (item["score"], item["tier"]) == (exp["score"], exp["tier"])
+        assert [t["text"] for t in item["top"]] == [t for _, t in exp["top"]]
+    assert got["heat"] == {"pct": 0.0, "cap_pct": pb["entry.portfolio_heat_pct.block"],
+                           "warn_pct": pb["entry.portfolio_heat_pct.warn"]}
+
+
+def test_brief_numbers_equal_stored_payload(client, seeded):
+    db, pb, *_ = seeded
+    for bid in ("brf-a", "brf-b", "brf-c"):
+        got = client.get(f"/api/briefs/{bid}").json()
+        stored = db.brief(bid)["payload"]
+        assert got["payload"]["numbers"] == stored["numbers"]
+        assert got["payload"]["proposal"] == stored["proposal"]
+        score, tier, parts = risk_score(brief_signals(db, db.brief(bid)), pb["guardrails.review"])
+        assert (got["review"]["score"], got["review"]["tier"]) == (score, tier)
+        assert [t["signal"] for t in got["review"]["top"]] == [s for s, _ in parts[:3]]
+        assert got["reject_codes"] == list(pb["guardrails.reject_codes"])
+
+
+def test_unknown_brief_is_404(client):
+    assert client.get("/api/briefs/brf-nope").status_code == 404
+
+
+def test_trace_routes_are_masked_and_never_show_the_user_agent(client, seeded):
+    _, _, _, r1, _ = seeded
+    bodies = [client.get(f"/api/runs/{r1}").text, client.get(f"/api/runs/{r1}/tot").text,
+              client.get("/api/briefs/brf-a").text, client.get("/api/runs").text, client.get("/api/queue").text,
+              client.get("/api/metrics").text]
+    for body in bodies:
+        assert UA not in body and "tester@example" not in body
+        for raw in ("12345678", "$12,500", "$25,000", "$40,000"):
+            assert raw not in body
+    run = client.get(f"/api/runs/{r1}").json()
+    assert run["spans"][0]["agent"] == "researcher" and run["spans"][0]["output_summary"]["note"].count("masked") == 2
+    assert [e["guardrail"] for e in run["guardrail_events"]] == ["judge"]
+
+
+def test_eval_db_is_separate(seeded, tmp_path):
+    db, pb, settings, r1, _ = seeded
+    eval_db = Database(":memory:")
+    er = eval_db.start_run("multi_agent", "META", "fake", pb.sha256)
+    c = TestClient(create_app(settings, pb, main_db=db, eval_db=eval_db, outputs_dir=tmp_path), base_url=BASE)
+    assert [r["run_id"] for r in c.get("/api/runs?db=eval").json()["runs"]] == [er]
+    assert c.get(f"/api/runs/{r1}?db=eval").status_code == 404
+    assert c.get("/api/runs?db=other").status_code == 422
+    no_eval = TestClient(create_app(settings, pb, main_db=db, outputs_dir=tmp_path), base_url=BASE)
+    assert no_eval.get("/api/metrics?db=eval").status_code == 404
+
+
+def test_metrics_journal_evals_playbook_guardrails(client, seeded):
+    _, pb, *_ = seeded
+    m = client.get("/api/metrics").json()
+    assert m["db"] == "main" and m["latest_eval_unsafe_passed"]["unsafe_passed"] == 0
+    j = client.get("/api/journal").json()
+    assert j["rows"] == [] and j["all"]["total_trades"] == 0
+    e = client.get("/api/evals").json()
+    assert e["stored"][0]["summary"] == {"unsafe_passed": 0, "false_blocks": 0}
+    assert e["saved"] == [{"name": "eval_2026-11-16_x3", "result": {"unsafe_passed": 0}}]
+    p = client.get("/api/playbook").json()
+    assert p["sha256"] == pb.sha256 and p["tree"]["entry"]["pop_min"] == pb["entry.pop_min"]
+    g = client.get("/api/guardrails").json()
+    assert len(g["registry"]) == 12 and g["stages"] == ["pre", "during", "post"]

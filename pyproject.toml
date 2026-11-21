@@ -25,12 +25,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pre-commit>=3.7"]
+# local web UI (python -m options_copilot.cli ui)
+ui = ["fastapi==0.162.0", "uvicorn==0.54.0"]
 
 [project.scripts]
 copilot = "options_copilot.cli:main"
 
 [tool.setuptools]
-packages = ["options_copilot"]
+packages = ["options_copilot", "options_copilot.multi_agent", "options_copilot.api"]
 
 [tool.setuptools.package-data]
 options_copilot = ["*.yaml"]

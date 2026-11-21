@@ -1355,7 +1355,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id")
     p.add_argument("--full", action="store_true")
     p.set_defaults(func=cmd_trace)
+
+    p = sub.add_parser("ui", help="start the local review cockpit on 127.0.0.1 (paper only)")
+    p.add_argument("--host", default="127.0.0.1", help="must be 127.0.0.1; anything else is refused")
+    p.add_argument("--port", type=int, default=8765)
+    p.set_defaults(func=cmd_ui)
     return parser
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    from .api.security import BindError
+    from .api.server import serve
+    try:
+        serve(load_settings(), args.host, args.port)
+    except BindError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
