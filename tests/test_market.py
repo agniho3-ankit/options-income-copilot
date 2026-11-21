@@ -46,3 +46,25 @@ def test_chain_parsing_skips_crossed_quotes_and_bad_iv():
     assert [(q.option_type, q.strike) for q in quotes] == [(OptionType.PUT, 90.0), (OptionType.CALL, 110.0)]
     assert quotes[0].iv == 0.3 and quotes[0].open_interest == 600 and flow == 2.0
     assert quotes[1].iv is None and quotes[1].open_interest is None
+
+
+def test_history_dates_are_plain_dates_even_from_timestamps():
+    """yfinance indexes by pandas Timestamps (datetime subclasses); History.dates must hold dates."""
+    from datetime import datetime
+
+    class _Hist(dict):
+        index = [datetime(2026, 11, 19, 0, 0), datetime(2026, 11, 20, 0, 0)]
+
+    class _T:
+        def __init__(self, t):
+            pass
+
+        def history(self, period, auto_adjust):
+            return _Hist(Close=[1.0, 2.0], High=[1.5, 2.5], Low=[0.5, 1.5])
+
+    class _Y:
+        Ticker = _T
+
+    h = Market(_Y).history("TICKER_A")
+    assert h.dates == [date(2026, 11, 19), date(2026, 11, 20)]
+    assert all(type(d) is date for d in h.dates) and h.dates[-1] <= date(2026, 11, 20)

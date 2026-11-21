@@ -192,3 +192,98 @@ def test_metrics_journal_evals_playbook_guardrails(client, seeded):
     assert p["sha256"] == pb.sha256 and p["tree"]["entry"]["pop_min"] == pb["entry.pop_min"]
     g = client.get("/api/guardrails").json()
     assert len(g["registry"]) == 12 and g["stages"] == ["pre", "during", "post"]
+
+
+# --- slice 3: evidence, guardrail strip, trade window ---------------------------------------
+
+from datetime import date, timedelta  # noqa: E402
+
+from options_copilot.api.app import MarketCache  # noqa: E402
+from options_copilot.market import History, Profile  # noqa: E402
+
+TODAY = date(2026, 11, 20)
+
+
+class FakeMarket:
+    def __init__(self, fail: bool = False):
+        self.fail, self.calls = fail, 0
+
+    def history(self, ticker, period="1y"):
+        self.calls += 1
+        if self.fail:
+            raise ConnectionError("offline")
+        days = [TODAY - timedelta(days=99 - i) for i in range(100)]
+        return History(closes=[450.0] * 100, highs=[451.0] * 100, lows=[449.0] * 100, dates=days)
+
+    def profile(self, ticker, as_of):
+        return Profile(price=450.0, market_cap=None, sector=None, country=None, analyst_target=None,
+                       analyst_count=None, analyst_buy_ratio=None, earnings_date=date(2027, 1, 28),
+                       ex_dividend_date=None, dividend_rate=None)
+
+
+def _grader(db, run_id, text):
+    db.add_trace(run_id, "user", {"ticker": "MSFT", "excerpts": [{"id": "c1", "form": "8-K", "item": "Item 1.01",
+                                                                   "text": text}]}, name="researcher.grader")
+
+
+def _app(seeded, tmp_path, market):
+    db, pb, settings, *_ = seeded
+    return TestClient(create_app(settings, pb, main_db=db, outputs_dir=tmp_path, market_factory=lambda: market,
+                                 today=lambda: TODAY), base_url=BASE)
+
+
+def test_brief_has_guardrail_strip_and_sorted_alternatives(client):
+    b = client.get("/api/briefs/brf-a").json()
+    strip = {g["name"]: g for g in b["guardrail_strip"]}
+    assert len(strip) == 12 and strip["judge"]["decision"] == "flag" and strip["verifier"]["decision"] is None
+    assert UA not in json.dumps(strip) and "$25,000" not in json.dumps(strip)
+
+
+def test_evidence_returns_masked_excerpts_and_metadata_citations(seeded, tmp_path):
+    db, _, _, r1, _ = seeded
+    _grader(db, r1, f"<script>alert(1)</script> The deal closes on December 15, 2026 for $2,500,000. {UA}")
+    c = _app(seeded, tmp_path, FakeMarket())
+    e = c.get("/api/briefs/brf-a/evidence").json()
+    assert e["citations"] == db.brief("brf-a")["payload"]["citations"]
+    text = e["excerpts"][0]["text"]
+    assert text.startswith("<script>")          # returned as data; the UI renders it as plain text
+    assert "$2,500,000" not in text and UA not in text
+    assert c.get("/api/briefs/brf-b/evidence").json()["note"] == "no graded excerpts are stored for this run"
+
+
+def test_window_is_computed_in_python_from_live_prices(seeded, tmp_path):
+    db, _, _, r1, _ = seeded
+    _grader(db, r1, "The merger is expected to close on December 15, 2026.")
+    db.add_iv_snapshot("MSFT", "2026-11-19", 0.31, None, None)
+    m = FakeMarket()
+    c = _app(seeded, tmp_path, m)
+    w = c.get("/api/briefs/brf-a/window").json()
+    assert w["spot"] == 450.0 and w["sigma"]["iv"] == 0.31 and w["expiry"] == "2027-01-15"
+    assert w["breakevens"] == db.brief("brf-a")["payload"]["numbers"]["breakevens"]
+    assert {e["kind"] for e in w["events"]} >= {"earnings", "filing", "filing_event"}
+    assert w["freshness"] == {"stale": False, "age_s": 0}
+    c.get("/api/briefs/brf-a/window")
+    assert m.calls == 1                         # second view served from the cache
+
+
+def test_window_without_market_data_is_503_not_a_guess(seeded, tmp_path):
+    c = _app(seeded, tmp_path, FakeMarket(fail=True))
+    r = c.get("/api/briefs/brf-a/window")
+    assert r.status_code == 503 and "market data unavailable" in r.json()["detail"]
+
+
+def test_market_cache_serves_stale_data_when_a_refresh_fails():
+    t = [0.0]
+    m = FakeMarket()
+    cache = MarketCache(lambda: m, ttl=10, clock=lambda: t[0])
+    cache.get("MSFT", TODAY)
+    m.fail, t[0] = True, 60.0
+    _, _, fresh = cache.get("msft", TODAY)
+    assert fresh["stale"] is True and fresh["age_s"] == 60 and "ConnectionError" in fresh["error"]
+
+
+def test_fastapi_telemetry_is_fully_off(client):
+    from options_copilot.api.app import TELEMETRY_OFF
+    cfg = client.app._telemetry
+    assert all(cfg[k] is False for k in TELEMETRY_OFF) and cfg["auto_configure"] is False
+    assert client.app._native_telemetry.enabled() is False

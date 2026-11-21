@@ -2,10 +2,11 @@ import { useState } from "react";
 import { Header } from "./components/Header";
 import { useRoute, type Route } from "./lib/route";
 import { applyTheme, initialTheme, type Theme } from "./lib/theme";
+import { Review } from "./screens/Review";
 import { Today } from "./screens/Today";
 
-const LATER: Record<Exclude<Route["screen"], "today">, string> = {
-  review: "slice 3", explore: "slice 5", positions: "slice 6", journal: "slice 6", lab: "slice 7", playbook: "slice 7",
+const LATER: Record<Exclude<Route["screen"], "today" | "review">, string> = {
+  explore: "slice 5", positions: "slice 6", journal: "slice 6", lab: "slice 7", playbook: "slice 7",
 };
 
 export function App() {
@@ -24,9 +25,9 @@ export function App() {
     <div className="app">
       <Header route={route} theme={theme} onToggleTheme={toggle} />
       <main className="main" id="main">
-        {route.screen === "today" ? <Today /> : (
-          <p className="empty">This screen is not built yet ({LATER[route.screen]}).</p>
-        )}
+        {route.screen === "today" ? <Today />
+          : route.screen === "review" ? <Review key={route.id ?? "none"} id={route.id} />
+          : <p className="empty">This screen is not built yet ({LATER[route.screen]}).</p>}
       </main>
     </div>
   );

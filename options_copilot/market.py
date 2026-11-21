@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from .calculators import Quote
@@ -22,6 +22,7 @@ class History:
     closes: list[float]
     highs: list[float]
     lows: list[float]
+    dates: list[date] = field(default_factory=list)   # trading days, same order as closes
 
 
 @dataclass(frozen=True)
@@ -70,8 +71,10 @@ class Market:
 
     def history(self, ticker: str, period: str = "2y") -> History:
         df = self._t(ticker).history(period=period, auto_adjust=False)
+        # pandas Timestamps are datetimes; keep plain dates so they compare with date objects
+        days = [i.date() if isinstance(i, datetime) else _date(i) for i in df.index]
         return History(closes=[float(x) for x in df["Close"]], highs=[float(x) for x in df["High"]],
-                       lows=[float(x) for x in df["Low"]])
+                       lows=[float(x) for x in df["Low"]], dates=days)
 
     def profile(self, ticker: str, as_of: date) -> Profile:
         t = self._t(ticker)

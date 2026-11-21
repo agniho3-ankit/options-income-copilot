@@ -61,3 +61,49 @@ export async function post<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   }));
 }
+
+// --- Review ------------------------------------------------------------------------------
+
+export type Check = { name: string; verdict: string; reason: string; hard?: boolean };
+export type Citation = { form?: string; date?: string; item?: string; url?: string };
+export type Alternative = { node?: string; path?: string; status?: string; score: number; reason?: string };
+export type StripEvent = { seq: number; decision: string; signal: string | null; reason: string | null };
+export type StripItem = { name: string; stage: string; kind: string; what: string; decision: string | null; events: StripEvent[] };
+export type Numbers = { credit?: number; max_loss?: number; pop?: number; breakevens?: number[]; risk_pct_of_portfolio?: number };
+export type JudgeFlag = { claim: string; issue: string; conflicts_with?: string };
+
+export type BriefView = {
+  brief: { brief_id: string; run_id: string | null; kind: string; ticker: string; status: string; verdict: string | null;
+    created_at: string; decided_at: string | null; decision_reason: string | null; decision_code: string | null;
+    deferred_at: string | null };
+  payload: Record<string, unknown> & {
+    as_of?: string; numbers?: Numbers; proposal?: { strategy?: string; legs?: Leg[]; expiry?: string };
+    verifier?: Check[]; risks?: string[]; judge?: { flags?: JudgeFlag[]; note?: string }; summary?: string;
+    landmine_verdict?: string; strategy?: string; legs?: Leg[]; exit_rule?: string; close_cost?: number;
+    est_pnl?: number; profit_pct?: number; dte?: number; entry_credit?: number;
+    new?: { proposal?: { strategy?: string; legs?: Leg[]; expiry?: string }; numbers?: Numbers };
+  };
+  review: { score: number; tier: Tier; signals: Record<string, number>; top: { signal: string; points: number; text: string }[] };
+  guardrail_strip: StripItem[];
+  alternatives: Alternative[];
+  reject_codes: string[];
+};
+
+export type Evidence = {
+  brief_id: string; landmine_verdict: string | null; citations: Citation[];
+  excerpts: { id: string; form: string | null; item: string | null; text: string }[]; note: string | null;
+};
+
+export type WindowEvent = { date: string; kind: string; label: string; source: string; in_window: boolean };
+export type TradeWindow = {
+  ticker: string; kind: string; strategy: string | null; brief_as_of: string; today: string; expiry: string; spot: number;
+  sigma: { iv: number | null; source: string; convention: string; at_expiry: { date: string; low: number; high: number } | null };
+  history: { date: string; close: number }[];
+  cone: { date: string; low: number; high: number }[];
+  strikes: { side: string | null; option_type: string | null; strike: number | null }[];
+  breakevens: number[];
+  zones: { kind: "profit" | "loss"; low: number | null; high: number | null }[];
+  events: WindowEvent[];
+  x_domain: [string, string]; y_domain: [number, number];
+  freshness: { stale: boolean; age_s: number; error?: string };
+};

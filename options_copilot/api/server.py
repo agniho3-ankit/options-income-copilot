@@ -19,6 +19,8 @@ def build(settings: Settings, port: int):
 
 def serve(settings: Settings, host: str, port: int) -> None:
     check_bind(host)   # refuse before anything else starts
+    from ..multi_agent import privacy
+    privacy.configure()   # OpenTelemetry SDK disabled, no exporters, framework telemetry off
     import uvicorn
     app = build(settings, port)
     print(f"Options Income Copilot UI on http://{host}:{port}  (paper only; Ctrl+C to stop)")

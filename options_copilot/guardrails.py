@@ -246,3 +246,21 @@ def risk_score(signals: dict[str, int], review_cfg: dict) -> tuple[int, str, lis
     tier = ("escalated" if score >= tiers["escalated_at"] else
             "look_closely" if score >= tiers["look_closely_at"] else "standard")
     return score, tier, sorted(parts, key=lambda x: (-x[1], SIGNALS.index(x[0])))
+
+
+# --- per-guardrail summary of one run (the review screen's pipeline strip) ---------------
+
+_SEVERITY = {"pass": 0, "flag": 1, "block": 2}
+
+
+def pipeline_summary(events: list[dict]) -> list[dict]:
+    """One entry per registered guardrail, in pipeline order, with its most severe decision on
+    this run (block > flag > pass) and every event behind it. `decision` is None if it never ran."""
+    out = []
+    for g in REGISTRY:
+        mine = [e for e in events if e.get("guardrail") == g.name]
+        worst = max((e["decision"] for e in mine), key=lambda d: _SEVERITY.get(d, -1), default=None)
+        out.append({"name": g.name, "stage": g.stage, "kind": g.kind, "what": g.what, "decision": worst,
+                    "events": [{"seq": e.get("seq"), "decision": e["decision"], "signal": e.get("signal"),
+                                "reason": e.get("reason")} for e in mine]})
+    return out

@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +32,40 @@ from .security import (CSRF_HEADER, DEV_PORT, LOCAL_HOST, LocalOnlyMiddleware, a
                        scrub)
 
 DbName = Query("main", pattern="^(main|eval)$")
+MARKET_TTL_SECONDS = 300
+TELEMETRY_OFF = {"tracing": False, "metrics": False, "logs": False, "operation_spans": False,
+                 "auto_configure": False}
+
+
+class MarketCache:
+    """Live market data with a short in-memory cache. If a fetch fails, the last good result
+    is returned marked stale; if there is none, the caller gets the error."""
+
+    def __init__(self, market_factory: Callable[[], Any], ttl: float = MARKET_TTL_SECONDS,
+                 clock: Callable[[], float] = time.monotonic):
+        self._factory, self._market, self.ttl, self._clock = market_factory, None, ttl, clock
+        self._rows: dict[str, tuple[float, Any, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, ticker: str, today: date) -> tuple[Any, Any, dict]:
+        """(history, profile, freshness) for one ticker."""
+        key = ticker.upper()
+        with self._lock:
+            hit = self._rows.get(key)
+            now = self._clock()
+            if hit and now - hit[0] < self.ttl:
+                return hit[1], hit[2], {"stale": False, "age_s": round(now - hit[0])}
+            try:
+                if self._market is None:
+                    self._market = self._factory()
+                hist, prof = self._market.history(key, "1y"), self._market.profile(key, today)
+            except Exception as exc:  # noqa: BLE001 - any data-source failure falls back to the cache
+                if hit:
+                    return hit[1], hit[2], {"stale": True, "age_s": round(now - hit[0]),
+                                            "error": f"live fetch failed ({type(exc).__name__})"}
+                raise HTTPException(503, f"market data unavailable for {key} ({type(exc).__name__})") from exc
+            self._rows[key] = (now, hist, prof)
+            return hist, prof, {"stale": False, "age_s": 0}
 
 
 @dataclass
@@ -42,6 +78,8 @@ class AppState:
     outputs_dir: Path
     dist_dir: Path | None
     port: int
+    market: MarketCache | None = None
+    today: Callable[[], date] = date.today
     csrf_token: str = field(default_factory=new_token)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -59,12 +97,20 @@ class AppState:
 
 
 def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: Database | None = None,
-               outputs_dir: Path | None = None, dist_dir: Path | None = None, port: int = 8765) -> FastAPI:
+               outputs_dir: Path | None = None, dist_dir: Path | None = None, port: int = 8765,
+               market_factory: Callable[[], Any] | None = None, today: Callable[[], date] = date.today) -> FastAPI:
+    if market_factory is None:
+        def market_factory():
+            from ..market import Market
+            return Market()
     st = AppState(settings=settings, pb=pb, main_db=main_db, eval_db=eval_db,
                   masker=Masker(settings.synthetic_portfolio_value),
-                  outputs_dir=outputs_dir or settings.repo_root / "demo_outputs", dist_dir=dist_dir, port=port)
+                  outputs_dir=outputs_dir or settings.repo_root / "demo_outputs", dist_dir=dist_dir, port=port,
+                  market=MarketCache(market_factory), today=today)
     # no /docs, /redoc or /openapi.json: the Swagger page pulls assets from a CDN
-    app = FastAPI(title="Options Income Copilot (local)", docs_url=None, redoc_url=None, openapi_url=None)
+    # FastAPI's built-in OpenTelemetry instrumentation: every part off, and no exporter is ever added
+    app = FastAPI(title="Options Income Copilot (local)", docs_url=None, redoc_url=None, openapi_url=None,
+                  telemetry=TELEMETRY_OFF)
     app.state.ui = st
     app.add_middleware(CORSMiddleware, allow_origins=[f"http://{LOCAL_HOST}:{DEV_PORT}"],
                        allow_methods=["GET", "POST"], allow_headers=[CSRF_HEADER, "Content-Type"])
@@ -119,7 +165,7 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
 
     @app.get("/api/briefs/{brief_id}")
     def brief(brief_id: str) -> dict:
-        from ..guardrails import risk_score
+        from ..guardrails import pipeline_summary, risk_score
         from ..review import brief_signals, explain
         with st.db() as db:
             b = db.brief(brief_id)
@@ -130,12 +176,50 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
             row = next((r for r in db.briefs() if r["brief_id"] == brief_id), {})
         score, tier, parts = risk_score(sig, st.pb["guardrails.review"])
         payload = b.pop("payload")
+        alts = sorted((a for a in payload.get("alternatives") or [] if a.get("score") is not None),
+                      key=lambda a: -a["score"])
         return out({"brief": {**b, "decision_code": row.get("decision_code"), "deferred_at": row.get("deferred_at")},
                     "payload": payload,
                     "review": {"score": score, "tier": tier, "signals": sig,
                                "top": [{"signal": s, "points": p, "text": explain(s, sig[s])} for s, p in parts[:3]]},
                     "guardrail_events": masked(events),
+                    "guardrail_strip": masked(pipeline_summary(events)),
+                    "alternatives": alts[:6],
                     "reject_codes": list(st.pb["guardrails.reject_codes"])})
+
+    @app.get("/api/briefs/{brief_id}/evidence")
+    def evidence(brief_id: str) -> dict:
+        """Citations (rebuilt from chunk metadata) and the masked excerpts the researcher graded.
+        Excerpts are untrusted filing text: the UI shows them as quoted plain text only."""
+        from ..window import excerpts_from_trace
+        with st.db() as db:
+            b = db.brief(brief_id)
+            if b is None:
+                raise HTTPException(404, f"no brief {brief_id}")
+            excerpts = excerpts_from_trace(db.trace(b["run_id"])) if b.get("run_id") else []
+        p = b["payload"]
+        return masked({"brief_id": brief_id, "landmine_verdict": p.get("landmine_verdict"),
+                       "citations": p.get("citations") or [], "excerpts": excerpts,
+                       "note": None if excerpts else "no graded excerpts are stored for this run"})
+
+    @app.get("/api/briefs/{brief_id}/window")
+    def window(brief_id: str) -> dict:
+        """Trade-window chart data, computed in Python from live prices (cached briefly)."""
+        from ..window import WindowError, build_window, excerpts_from_trace
+        with st.db() as db:
+            b = db.brief(brief_id)
+            if b is None:
+                raise HTTPException(404, f"no brief {brief_id}")
+            excerpts = excerpts_from_trace(db.trace(b["run_id"])) if b.get("run_id") else []
+            today = st.today()
+            ivs = [v for d, v in db.iv_history(b["ticker"]) if d <= today.isoformat()]
+        hist, prof, fresh = st.market.get(b["ticker"], today)
+        try:
+            w = build_window(ticker=b["ticker"], kind=b["kind"], payload=b["payload"], history=hist, profile=prof,
+                             today=today, atm_iv=ivs[-1] if ivs else None, excerpts=excerpts)
+        except WindowError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return out({**w, "freshness": fresh})
 
     # --- runs, spans, guardrail events, the ToT tree ------------------------------------------
 
