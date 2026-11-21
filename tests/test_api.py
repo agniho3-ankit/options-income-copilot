@@ -128,6 +128,10 @@ def test_queue_order_matches_review_queue(client, seeded):
     for item, exp in zip(got["trades"], expected["trades"]):
         assert (item["score"], item["tier"]) == (exp["score"], exp["tier"])
         assert [t["text"] for t in item["top"]] == [t for _, t in exp["top"]]
+    first = next(i for i in got["trades"] if i["brief_id"] == "brf-a")
+    stored = db.brief("brf-a")["payload"]["proposal"]
+    assert first["trade"]["strategy"] == stored["strategy"] and first["trade"]["expiry"] == stored["expiry"]
+    assert [g["strike"] for g in first["trade"]["legs"]] == [g["strike"] for g in stored["legs"]]
     assert got["heat"] == {"pct": 0.0, "cap_pct": pb["entry.portfolio_heat_pct.block"],
                            "warn_pct": pb["entry.portfolio_heat_pct.warn"]}
 

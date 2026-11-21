@@ -61,6 +61,8 @@ PATTERNS = [
     ("long-hex-token", re.compile(r"\b[0-9a-fA-F]{40,}\b")),
 ]
 LONG_TOKEN = re.compile(r"[A-Za-z0-9+/_-]{40,}={0,2}")
+# npm lockfile subresource-integrity hashes are public package checksums, not secrets
+SRI_HASH = re.compile(r'"integrity":\s*"sha(?:256|384|512)-[A-Za-z0-9+/]+={0,2}"')
 
 
 @dataclass(frozen=True)
@@ -98,7 +100,7 @@ def scan_text(text: str, path: str, denylist: list[str]) -> list[Finding]:
         for rule, pattern in PATTERNS:
             if pattern.search(line):
                 findings.append(Finding(path, lineno, rule))
-        if any(_looks_random(t) for t in LONG_TOKEN.findall(line)):
+        if any(_looks_random(t) for t in LONG_TOKEN.findall(SRI_HASH.sub("", line))):
             findings.append(Finding(path, lineno, "long-random-token"))
         low = line.lower()
         for idx, entry in enumerate(lowered_deny, start=1):

@@ -108,8 +108,11 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
         with st.db() as db:
             q = review_queue(db, st.pb)
             losses = [p.entry_max_loss * p.contracts for p in open_positions(db)]
+            summaries = {i["brief_id"]: trade_summary(i["kind"], db.brief(i["brief_id"])["payload"])
+                         for i in q["trades"]}
         heat = portfolio_heat_pct(losses, st.settings.synthetic_portfolio_value)
-        trades = [{**i, "top": [{"signal": s, "text": t} for s, t in i["top"]]} for i in q["trades"]]
+        trades = [{**i, "top": [{"signal": s, "text": t} for s, t in i["top"]], "trade": summaries[i["brief_id"]]}
+                  for i in q["trades"]]
         return out({"trades": trades, "info": q["info"],
                     "heat": {"pct": heat, "cap_pct": st.pb["entry.portfolio_heat_pct.block"],
                              "warn_pct": st.pb["entry.portfolio_heat_pct.warn"]}})
@@ -205,10 +208,32 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                 raise HTTPException(404, "no such API route")
             f = (root / path).resolve()
             if path and f.is_file() and root in f.parents:
-                return FileResponse(f)
-            return FileResponse(root / "index.html")
+                return FileResponse(f)   # hashed asset names, safe to cache
+            # always revalidate the page so a rebuild is picked up
+            return FileResponse(root / "index.html", headers={"Cache-Control": "no-cache"})
 
     return app
+
+
+def _legs(legs: list[dict] | None) -> list[dict]:
+    return [{"side": g.get("side"), "option_type": g.get("option_type", g.get("type")), "strike": g.get("strike"),
+             "expiry": g.get("expiry")} for g in legs or []]
+
+
+def trade_summary(kind: str, p: dict) -> dict:
+    """What a queue card shows, copied from the stored payload (no values are derived)."""
+    if kind == "entry":
+        prop = p.get("proposal") or {}
+        legs = _legs(prop.get("legs"))
+        return {"strategy": prop.get("strategy"), "legs": legs,
+                "expiry": prop.get("expiry") or next((g["expiry"] for g in legs if g["expiry"]), None)}
+    legs = _legs(p.get("legs"))
+    out = {"strategy": p.get("strategy"), "legs": legs, "expiry": next((g["expiry"] for g in legs if g["expiry"]), None),
+           "exit_rule": p.get("exit_rule"), "action": (p.get("decision") or {}).get("action"), "dte": p.get("dte")}
+    if kind == "roll" and p.get("new"):
+        new = p["new"].get("proposal") or {}
+        out["new"] = {"strategy": new.get("strategy"), "legs": _legs(new.get("legs")), "expiry": new.get("expiry")}
+    return out
 
 
 def _thaw(node: Any) -> Any:

@@ -1,0 +1,51 @@
+/* Calm terminal design tokens. Dark is the default; [data-theme="light"] overrides.
+   One accent. Status colors always travel with a shape (see components/Status.tsx):
+   pass ◆ teal · caution ▲ amber · block ■ coral · info ● slate.
+   Contrast is checked against WCAG AA by src/test/tokens.test.ts. */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0e1116;
+  --surface: #151a21;
+  --surface-2: #1c222b;
+  --line: #262d38;
+  --text: #e4e8ee;
+  --text-muted: #9ba5b4;
+  --accent: #93a7ff;
+  --accent-ink: #0e1116;
+  --pass: #4cc9b8;
+  --caution: #e6b450;
+  --block: #f2877a;
+  --info: #a2afc0;
+  --focus: #93a7ff;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #eceff3;
+  --line: #dce1e8;
+  --text: #1a1f27;
+  --text-muted: #556070;
+  --accent: #3446c4;
+  --accent-ink: #ffffff;
+  --pass: #0b6f64;
+  --caution: #845400;
+  --block: #b33a2c;
+  --info: #4f5c6e;
+  --focus: #3446c4;
+}
+
+:root {
+  --font-text: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --radius: 6px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --leading: 1.55;
+}

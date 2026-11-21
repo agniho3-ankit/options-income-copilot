@@ -52,6 +52,13 @@ def test_ordinary_text_is_not_flagged(audit, text):
     assert rules(audit, text) == []
 
 
+def test_npm_integrity_hashes_are_not_tokens_but_other_tokens_on_the_line_are(audit):
+    sri = '"integrity": "sha512-JZnDKK8B0RCDw84FNdDAIpZK+JuJw+s7Lz8nksI7SIuU3UXJJslUthsi+uWBUYOwPFwW7W7PRLRfUKpxjtjFCw==",'
+    assert rules(audit, sri) == []
+    fake = "aB3dE5fG7hJ9kL1mN3pQ5" + "rS7tU9vW1xY3zA5bC7dE9"   # split so this file passes its own audit
+    assert rules(audit, f'{sri} "x": "{fake}"') == ["long-random-token"]
+
+
 def test_denylist_matches_case_insensitively_without_echoing_value(audit):
     findings = audit.scan_text("Written by JANE EXAMPLE", "notes.md", ["Jane Example"])
     assert [f.rule for f in findings] == ["denylist entry #1"]
