@@ -16,7 +16,7 @@ export type QueueTrade = {
 export type InfoItem = { run_id: string; ticker: string; kind: string; outcome: string; when: string; why: string; next: string };
 export type Queue = { trades: QueueTrade[]; info: InfoItem[]; heat: { pct: number; cap_pct: number; warn_pct: number } };
 export type Session = {
-  csrf_token: string; paper_only: true; databases: { main: boolean; eval: boolean };
+  csrf_token: string; paper_only: true; demo?: boolean; databases: { main: boolean; eval: boolean };
   playbook: { version: number; sha256: string };
 };
 

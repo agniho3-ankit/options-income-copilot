@@ -375,3 +375,5 @@ a.button.primary { background: var(--accent); color: var(--accent-ink); border-c
 .glossary dt { font-weight: 500; }
 .glossary dd { margin: 0 0 var(--space-2); color: var(--text-muted); }
 .plain-list { margin: 0; padding-left: 1.1em; }
+.demo-data { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--info); border: 1px dashed var(--info); border-radius: 999px; padding: 2px 10px; }

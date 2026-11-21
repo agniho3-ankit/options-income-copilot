@@ -12,9 +12,9 @@ const NAV: { screen: Route["screen"]; label: string; href: string }[] = [
   { screen: "playbook", label: "Playbook", href: "#/playbook" },
 ];
 
-export function Header({ route, theme, onToggleTheme, searchRef, onShortcuts }: {
+export function Header({ route, theme, onToggleTheme, searchRef, onShortcuts, demo = false }: {
   route: Route; theme: Theme; onToggleTheme: () => void;
-  searchRef?: RefObject<HTMLInputElement | null>; onShortcuts?: () => void;
+  searchRef?: RefObject<HTMLInputElement | null>; onShortcuts?: () => void; demo?: boolean;
 }) {
   const next = theme === "dark" ? "light" : "dark";
   const [q, setQ] = useState("");
@@ -39,6 +39,11 @@ export function Header({ route, theme, onToggleTheme, searchRef, onShortcuts }: 
           onKeyDown={(e) => { if (e.key === "Escape") { setQ(""); e.currentTarget.blur(); } }} />
       </form>
       <div className="header-right">
+        {demo && (
+          <span className="demo-data" title="Synthetic demo data from data/ui_demo.db. Decisions here never touch your real data.">
+            Demo data
+          </span>
+        )}
         <span className="paper-only" title="Nothing here places a real order. Approve writes a paper ticket.">
           Paper only
         </span>

@@ -713,3 +713,30 @@ def test_playbook_lists_key_thresholds_from_the_loaded_file(client, seeded):
     keys = {k["path"]: k["value"] for k in p["key_thresholds"]}
     assert keys["entry.pop_min"] == pb["entry.pop_min"] and keys["management.r2_roll.dte_below"] == 21
     assert p["editable_by"] == "owner only, in the file" and p["sha256"] == pb.sha256
+
+
+# --- demo mode keeps away from real data --------------------------------------------------------
+
+def test_demo_mode_writes_lessons_to_its_own_store_and_refuses_runs(tmp_path, monkeypatch):
+    import options_copilot.store as store_mod
+    from options_copilot.api.server import DEMO_CHROMA, DEMO_DB, build
+    opened = []
+
+    class SpyStore(FakeStore):
+        def __init__(self, path):
+            super().__init__()
+            opened.append(path)
+    monkeypatch.setattr(store_mod, "Store", SpyStore)
+    settings = load_settings(env={"DATA_DIR": str(tmp_path)})
+    app = build(settings, 8765, "demo")
+    app.state.ui.llm_factory = lambda: None
+    c = TestClient(app, base_url=BASE)
+    s = c.get("/api/session").json()
+    assert s["demo"] is True and (tmp_path / DEMO_DB).is_file()
+    h = {**ORIGIN, "X-CSRF-Token": s["csrf_token"]}
+    r = c.post("/api/briefs/brf-demo-look/reject", json={"code": "other", "reason": "recording the demo"}, headers=h)
+    assert r.status_code == 200 and r.json()["lesson_by"].startswith("template")
+    assert opened == [tmp_path / DEMO_CHROMA] and opened[0] != settings.chroma_dir
+    run = c.post("/api/runs", json={"ticker": "MSFT"}, headers=h)
+    assert run.status_code == 409 and "demo" in run.json()["detail"]
+    assert not settings.db_path.exists()                      # the real database was never opened

@@ -1,6 +1,7 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Dialog } from "./components/Dialog";
 import { Header } from "./components/Header";
+import { getSession } from "./lib/api";
 import { SHORTCUTS, useShortcuts } from "./lib/keys";
 import { useRoute } from "./lib/route";
 import { applyTheme, initialTheme, type Theme } from "./lib/theme";
@@ -21,6 +22,8 @@ export function App() {
     return t;
   });
   const [sheet, setSheet] = useState(false);
+  const [demo, setDemo] = useState(false);
+  useEffect(() => { getSession().then((s) => setDemo(Boolean(s.demo))).catch(() => {}); }, []);
   const search = useRef<HTMLInputElement>(null);
   const toggle = () => {
     const next = theme === "dark" ? "light" : "dark";
@@ -39,7 +42,7 @@ export function App() {
         document.getElementById("main")?.focus();
       }}>Skip to content</a>
       <Header route={route} theme={theme} onToggleTheme={toggle} searchRef={search}
-        onShortcuts={() => setSheet(true)} />
+        onShortcuts={() => setSheet(true)} demo={demo} />
       <main className="main" id="main" tabIndex={-1}>
         {route.screen === "home" ? <Home />
           : route.screen === "today" ? <Today filter={route.filter} />

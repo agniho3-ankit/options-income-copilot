@@ -87,9 +87,9 @@ export function DecisionBar({ view, onDecided, initial = null }: {
               ))}
             </div>
           </fieldset>
-          <label className="field">
-            <span>Reason (it becomes a lesson for future runs)</span>
-            <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3} maxLength={1000} required />
+          <label className="field" htmlFor="reject-reason">
+            <span id="reject-reason-label">Reason (it becomes a lesson for future runs)</span>
+            <textarea id="reject-reason" aria-labelledby="reject-reason-label" value={reason} onChange={(e) => setReason(e.target.value)} rows={3} maxLength={1000} required />
           </label>
           <div className="decision-buttons">
             <button type="submit" className="danger" disabled={!canReject || busy}>Reject brief</button>

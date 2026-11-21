@@ -89,6 +89,7 @@ class AppState:
     db_factory: Callable[[], Any] | None = None      # a separate connection for slow reads
     sources_factory: Callable[[date], Any] | None = None   # live market sources for Positions
     positions_cache: dict = field(default_factory=dict)    # position_id -> (time, row)
+    demo: bool = False                               # serving the synthetic demo database
     poll_s: float = 0.5
 
     def store(self) -> Any:
@@ -116,7 +117,8 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                market_factory: Callable[[], Any] | None = None, today: Callable[[], date] = date.today,
                llm_factory: Callable[[], Any] | None = None, store_factory: Callable[[], Any] | None = None,
                job_runner: Callable[..., dict] | None = None, db_factory: Callable[[], Any] | None = None,
-               poll_s: float = 0.5, sources_factory: Callable[[date], Any] | None = None) -> FastAPI:
+               poll_s: float = 0.5, sources_factory: Callable[[date], Any] | None = None,
+               demo: bool = False) -> FastAPI:
     if market_factory is None:
         def market_factory():
             from ..market import Market
@@ -126,7 +128,7 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                   outputs_dir=outputs_dir or settings.repo_root / "demo_outputs", dist_dir=dist_dir, port=port,
                   market=MarketCache(market_factory), today=today,
                   llm_factory=llm_factory or (lambda: _local_llm(settings)),
-                  store_factory=store_factory or (lambda: _chroma_store(settings)), poll_s=poll_s)
+                  store_factory=store_factory or (lambda: _chroma_store(settings)), poll_s=poll_s, demo=demo)
     from .jobs import JobManager, live_runner
     st.db_factory = db_factory or (lambda: Database(settings.db_path))
     st.sources_factory = sources_factory or (lambda day: _market_sources(pb, day))
@@ -155,7 +157,7 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
 
     @app.get("/api/session")
     def session() -> dict:
-        return {"csrf_token": st.csrf_token, "paper_only": True,
+        return {"csrf_token": st.csrf_token, "paper_only": True, "demo": st.demo,
                 "databases": {"main": True, "eval": st.eval_db is not None},
                 "playbook": {"version": st.pb.version, "sha256": st.pb.sha256}}
 
@@ -270,6 +272,9 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
 
     @app.post("/api/runs")
     def start_run(body: RunBody) -> dict:
+        if st.demo:
+            raise HTTPException(409, "runs are switched off on the synthetic demo data; start the UI without "
+                                     "--db demo to run against real data")
         if body.kind == "monitor":
             ticker = "ALL"   # one pass over every open paper position
         else:

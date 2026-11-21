@@ -10,6 +10,7 @@ from .security import check_bind
 
 
 DEMO_DB = "ui_demo.db"
+DEMO_CHROMA = "ui_demo_chroma"
 
 
 def build(settings: Settings, port: int, db: str = "main"):
@@ -17,15 +18,24 @@ def build(settings: Settings, port: int, db: str = "main"):
     eval_path = settings.repo_root / SNAPSHOT_ROOT / "eval.db"
     dist = settings.repo_root / "ui" / "dist"
     main_path = settings.db_path
+    extra = {}
     if db == "demo":
         from ..ui_demo import build_demo_db
         main_path = settings.data_dir / DEMO_DB
         if not main_path.is_file():
             build_demo_db(main_path)
+        # demo decisions must never touch real data: reject lessons go to a separate Chroma store
+        # (never data/chroma, which real runs read), and background runs are switched off
+        demo_store = settings.data_dir / DEMO_CHROMA
+
+        def store_factory():
+            from ..store import Store
+            return Store(demo_store)
+        extra = {"store_factory": store_factory, "demo": True}
     return create_app(settings, load_playbook(settings.playbook_path), main_db=Database(main_path),
                       eval_db=Database(eval_path) if eval_path.is_file() else None,
                       dist_dir=dist if dist.is_dir() else None, port=port,
-                      db_factory=lambda: Database(main_path))
+                      db_factory=lambda: Database(main_path), **extra)
 
 
 def serve(settings: Settings, host: str, port: int, db: str = "main") -> None:
