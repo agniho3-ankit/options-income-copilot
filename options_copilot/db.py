@@ -254,7 +254,7 @@ class Database:
 
     # spans: one per node execution of a multi-agent run (summaries are masked by the caller)
     def add_span(self, run_id: str, span_id: str, parent_id: str | None, agent: str, pattern: str | None,
-                 started_at: str, ended_at: str, duration_ms: int, llm_calls: int, input_summary: Any,
+                 started_at: str, ended_at: str | None, duration_ms: int | None, llm_calls: int, input_summary: Any,
                  output_summary: Any, error: str | None = None, *, tokens: int = 0, fallbacks: int = 0,
                  decision: str | None = None, confidence: float | None = None, ticker: str | None = None,
                  as_of: str | None = None, citations: Any = None) -> None:
@@ -266,7 +266,14 @@ class Database:
             self.conn.execute(
                 "INSERT INTO spans (run_id, span_id, parent_id, agent, pattern, started_at, ended_at, duration_ms, "
                 "llm_calls, input_summary, output_summary, error, tokens, fallbacks, decision, confidence, ticker, "
-                "as_of, citations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "as_of, citations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id, span_id) DO UPDATE SET parent_id = excluded.parent_id, agent = excluded.agent, "
+                "pattern = excluded.pattern, started_at = excluded.started_at, ended_at = excluded.ended_at, "
+                "duration_ms = excluded.duration_ms, llm_calls = excluded.llm_calls, "
+                "input_summary = excluded.input_summary, output_summary = excluded.output_summary, "
+                "error = excluded.error, tokens = excluded.tokens, fallbacks = excluded.fallbacks, "
+                "decision = excluded.decision, confidence = excluded.confidence, ticker = excluded.ticker, "
+                "as_of = excluded.as_of, citations = excluded.citations",
                 (run_id, span_id, parent_id, agent, pattern, started_at, ended_at, duration_ms, llm_calls,
                  enc(input_summary), enc(output_summary), error, tokens, fallbacks, decision, confidence,
                  ticker, as_of, enc(citations)))

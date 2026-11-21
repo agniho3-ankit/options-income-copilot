@@ -22,7 +22,8 @@ from typing import Any, Callable, Iterator
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from ..config import Settings
 from ..db import Database
@@ -84,6 +85,8 @@ class AppState:
     store_factory: Callable[[], Any] | None = None   # Chroma lesson store
     llm_lock: threading.Lock = field(default_factory=threading.Lock)   # one LLM job at a time
     _store: Any = None
+    jobs: Any = None                                 # api.jobs.JobManager
+    poll_s: float = 0.5
 
     def store(self) -> Any:
         if self._store is None and self.store_factory is not None:
@@ -108,7 +111,9 @@ class AppState:
 def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: Database | None = None,
                outputs_dir: Path | None = None, dist_dir: Path | None = None, port: int = 8765,
                market_factory: Callable[[], Any] | None = None, today: Callable[[], date] = date.today,
-               llm_factory: Callable[[], Any] | None = None, store_factory: Callable[[], Any] | None = None) -> FastAPI:
+               llm_factory: Callable[[], Any] | None = None, store_factory: Callable[[], Any] | None = None,
+               job_runner: Callable[..., dict] | None = None, db_factory: Callable[[], Any] | None = None,
+               poll_s: float = 0.5) -> FastAPI:
     if market_factory is None:
         def market_factory():
             from ..market import Market
@@ -118,7 +123,10 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                   outputs_dir=outputs_dir or settings.repo_root / "demo_outputs", dist_dir=dist_dir, port=port,
                   market=MarketCache(market_factory), today=today,
                   llm_factory=llm_factory or (lambda: _local_llm(settings)),
-                  store_factory=store_factory or (lambda: _chroma_store(settings)))
+                  store_factory=store_factory or (lambda: _chroma_store(settings)), poll_s=poll_s)
+    from .jobs import JobManager, live_runner
+    st.jobs = JobManager(st.llm_lock, db_factory or (lambda: Database(settings.db_path)),
+                         job_runner or live_runner(settings, pb))
     # no /docs, /redoc or /openapi.json: the Swagger page pulls assets from a CDN
     # FastAPI's built-in OpenTelemetry instrumentation: every part off, and no exporter is ever added
     app = FastAPI(title="Options Income Copilot (local)", docs_url=None, redoc_url=None, openapi_url=None,
@@ -132,8 +140,12 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
         return scrub(obj, st.secrets)
 
     def masked(obj: Any) -> Any:
-        """Trace content is stored masked; mask again on the way out (idempotent) and scrub secrets."""
-        return out(st.masker.value(obj))
+        """Trace content is stored masked; mask it again on the way out and scrub secrets.
+
+        Summaries and data blobs go through the full mask (account values become % of portfolio);
+        every other string gets the free-text mask. Identifiers (`id`, `*_id`) and the stored ToT
+        trade numbers pass through, so links and charts keep working."""
+        return out(_remask(obj, st.masker))
 
     # --- session and static reference data ---------------------------------------------------
 
@@ -237,6 +249,51 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
     from .decisions import register as register_decisions
     register_decisions(app, st, out)
 
+    # --- background runs: start, status, live progress (Server-Sent Events) ---------------------
+
+    @app.post("/api/runs")
+    def start_run(body: RunBody) -> dict:
+        ticker = body.ticker.upper()
+        if st.pb.tier_of(ticker) is None:
+            raise HTTPException(422, f"{ticker} is not in the playbook universe")
+        try:
+            job = st.jobs.start(body.kind, ticker, st.today())
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return out(job.view())
+
+    @app.get("/api/jobs")
+    def jobs() -> dict:
+        active = st.jobs.active()
+        return out({"active": active.view() if active else None,
+                    "recent": [j.view() for j in list(st.jobs.jobs.values())[-10:]][::-1]})
+
+    @app.get("/api/jobs/{job_id}")
+    def job(job_id: str) -> dict:
+        j = st.jobs.get(job_id)
+        if j is None:
+            raise HTTPException(404, f"no job {job_id}")
+        return out(j.view())
+
+    @app.get("/api/jobs/{job_id}/events")
+    def job_events(job_id: str):
+        from .jobs import stream
+        j = st.jobs.get(job_id)
+        if j is None:
+            raise HTTPException(404, f"no job {job_id}")
+
+        def read(run_ids: list[str]):
+            spans, events, n_tot = [], [], 0
+            with st.db() as d:
+                for rid in run_ids:
+                    spans += [_decode(s, ("input_summary", "output_summary", "citations")) for s in d.spans(rid)]
+                    events += [_decode(e, ("data",)) for e in d.guardrail_events(rid)]
+                    n_tot += d.conn.execute("SELECT COUNT(*) FROM tot_nodes WHERE run_id = ?", (rid,)).fetchone()[0]
+            return masked(spans), masked(events), n_tot
+
+        return StreamingResponse(stream(j, read, poll_s=st.poll_s), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
     # --- runs, spans, guardrail events, the ToT tree ------------------------------------------
 
     @app.get("/api/runs")
@@ -255,7 +312,8 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                 raise HTTPException(404, f"no run {run_id}")
             spans = [_decode(s, ("input_summary", "output_summary", "citations")) for s in d.spans(run_id)]
             events = [_decode(e, ("data",)) for e in d.guardrail_events(run_id)]
-        return masked({"db": db, "run": r, "spans": spans, "guardrail_events": events})
+            linked = _linked(d, r)
+        return masked({"db": db, "run": r, "spans": spans, "guardrail_events": events, **linked})
 
     @app.get("/api/runs/{run_id}/tot")
     def tot(run_id: str, db: str = DbName) -> dict:
@@ -336,6 +394,11 @@ def trade_summary(kind: str, p: dict) -> dict:
     return out
 
 
+class RunBody(BaseModel):
+    ticker: str = Field(min_length=1, max_length=8, pattern=r"^[A-Za-z.]{1,8}$")
+    kind: str = Field(default="multi_agent", pattern="^(multi_agent|tot)$")
+
+
 def _local_llm(settings: Settings):
     """The UI uses the local model only: no cloud fallback, even if a key is configured."""
     from ..llm import FallbackClient, OllamaClient
@@ -346,6 +409,33 @@ def _local_llm(settings: Settings):
 def _chroma_store(settings: Settings):
     from ..store import Store
     return Store(settings.chroma_dir)
+
+
+def _linked(d: Database, run: dict) -> dict:
+    """The ToT run and brief a multi-agent run produced (from its stored final state), if any."""
+    if run["kind"] != "multi_agent":
+        return {"tot_run_id": run["run_id"] if run["kind"] == "tot" else None, "brief_id": None}
+    row = d.conn.execute("SELECT content FROM trace WHERE run_id = ? AND name = 'multi_agent.state' "
+                         "ORDER BY seq DESC LIMIT 1", (run["run_id"],)).fetchone()
+    try:
+        state = json.loads(row[0]) if row else {}
+    except json.JSONDecodeError:
+        state = {}
+    return {"tot_run_id": state.get("tot_run_id"), "brief_id": state.get("brief_id"),
+            "reasons": list(state.get("reasons") or [])[:5]}
+
+
+SUMMARY_KEYS = frozenset({"input_summary", "output_summary", "citations", "data"})
+
+
+def _remask(o: Any, masker: Masker, key: str | None = None) -> Any:
+    if isinstance(o, dict):
+        return {k: masker.value(v) if k in SUMMARY_KEYS else _remask(v, masker, str(k)) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_remask(v, masker, key) for v in o]
+    if isinstance(o, str):
+        return o if key is not None and (key == "id" or key.endswith("_id")) else masker.text(o)
+    return o
 
 
 def _thaw(node: Any) -> Any:

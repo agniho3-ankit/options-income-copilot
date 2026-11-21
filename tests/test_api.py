@@ -99,10 +99,11 @@ def test_unsafe_methods_need_token_and_local_origin(client):
     assert client.post("/api/anything", headers={**ORIGIN, "X-CSRF-Token": token}).status_code in (404, 405)
 
 
-WRITE_ROUTES = {"/api/briefs/{brief_id}/approve", "/api/briefs/{brief_id}/reject", "/api/briefs/{brief_id}/defer"}
+WRITE_ROUTES = {"/api/briefs/{brief_id}/approve", "/api/briefs/{brief_id}/reject", "/api/briefs/{brief_id}/defer",
+                "/api/runs"}
 
 
-def test_the_only_write_routes_are_the_three_decisions(client):
+def test_the_only_write_routes_are_the_three_decisions_and_starting_a_run(client):
     writes = {r.path for r in client.app.routes if set(getattr(r, "methods", set())) - {"GET", "HEAD"}}
     assert writes == WRITE_ROUTES
 
@@ -324,7 +325,8 @@ def _decide_app(seeded, tmp_path, llm=None, store=None):
     db, pb, settings, *_ = seeded
     store = store or FakeStore()
     app = create_app(settings, pb, main_db=db, outputs_dir=tmp_path, market_factory=lambda: FakeMarket(),
-                     today=lambda: TODAY, llm_factory=lambda: llm, store_factory=lambda: store)
+                     today=lambda: TODAY, llm_factory=lambda: llm, store_factory=lambda: store,
+                     job_runner=lambda *a: {"outcome": "NO_TRADE"})
     c = TestClient(app, base_url=BASE)
     token = c.get("/api/session").json()["csrf_token"]
     return c, {**ORIGIN, "X-CSRF-Token": token}, store
@@ -440,3 +442,165 @@ def test_decided_briefs_cannot_be_decided_again(seeded, tmp_path):
     assert c.post("/api/briefs/brf-c/approve", json={"brief_id": "brf-c", "ticker": "BAC"}, headers=h).status_code == 409
     assert c.post("/api/briefs/brf-c/defer", json={"brief_id": "brf-c"}, headers=h).status_code == 409
     assert len(db.tickets()) == 0
+
+
+# --- slice 5: background runs and Server-Sent Events ------------------------------------------
+
+import threading  # noqa: E402
+
+from options_copilot.api.jobs import JobManager, stream  # noqa: E402
+
+
+class StepRunner:
+    """Writes a multi-agent run the way the graph does (span at start, completed at end), one step
+    at a time, waiting for the test to release each step."""
+
+    def __init__(self, steps: int = 3):
+        self.go = [threading.Event() for _ in range(steps + 1)]
+        self.done = threading.Event()
+
+    def __call__(self, kind, ticker, as_of, db):
+        rid = db.start_run("multi_agent", ticker, "fake", "sha")
+        agents = ["researcher", "strategist", "verifier_gate"]
+        for i, agent in enumerate(agents, start=1):
+            self.go[i - 1].wait(5)
+            t0 = f"2026-11-20T10:00:0{i}"
+            db.add_span(rid, f"s{i}", None, agent, "one-way", t0, None, None, 0, {"note": "account 12345678"}, None)
+            db.add_guardrail_event(rid, i, f"s{i}", "verifier" if agent == "verifier_gate" else "budgets",
+                                   "post" if agent == "verifier_gate" else "during", "static", "pass", None,
+                                   f"step {i} cost $12,500")
+            db.add_span(rid, f"s{i}", None, agent, "one-way", t0, f"2026-11-20T10:00:0{i}.5", 500, i,
+                        {"note": "ok"}, {"done": True})
+        tid = db.start_run("tot", ticker, "fake", "sha")
+        db.save_tot_nodes(tid, [{"id": "n0", "parent_id": None, "depth": 0, "status": "open", "score": None,
+                                 "prune_reason": "", "source": "root"}])
+        self.go[-1].wait(5)
+        db.finish_run(rid, "SELECTED")
+        return {"run_id": rid, "outcome": "SELECTED", "brief_id": None, "tot_run_id": tid}
+
+
+def _jobs_app(tmp_path, seeded, runner):
+    _, pb, settings, *_ = seeded
+    path = tmp_path / "main.db"
+    main = Database(path)
+    app = create_app(settings, pb, main_db=main, outputs_dir=tmp_path, market_factory=lambda: FakeMarket(),
+                     today=lambda: TODAY, llm_factory=lambda: None, store_factory=lambda: FakeStore(),
+                     job_runner=runner, db_factory=lambda: Database(path), poll_s=0.01)
+    c = TestClient(app, base_url=BASE)
+    return c, {**ORIGIN, "X-CSRF-Token": c.get("/api/session").json()["csrf_token"]}, main
+
+
+def _events(text: str) -> list[tuple[str, dict]]:
+    out = []
+    for block in text.split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line and not line.startswith(":"))
+        if "event" in lines:
+            out.append((lines["event"], json.loads(lines["data"])))
+    return out
+
+
+def test_start_run_validates_and_needs_csrf(seeded, tmp_path):
+    r = StepRunner()
+    c, h, _ = _jobs_app(tmp_path, seeded, r)
+    assert c.post("/api/runs", json={"ticker": "MSFT"}, headers=ORIGIN).status_code == 403
+    assert c.post("/api/runs", json={"ticker": "ZZZZ"}, headers=h).status_code == 422      # not in the universe
+    assert c.post("/api/runs", json={"ticker": "MSFT", "kind": "eval"}, headers=h).status_code == 422
+    assert c.post("/api/runs", json={"ticker": "MS FT"}, headers=h).status_code == 422
+    assert c.get("/api/jobs").json()["active"] is None
+
+
+def test_one_llm_job_at_a_time(seeded, tmp_path):
+    r = StepRunner()
+    c, h, _ = _jobs_app(tmp_path, seeded, r)
+    first = c.post("/api/runs", json={"ticker": "msft"}, headers=h)
+    assert first.status_code == 200 and first.json()["ticker"] == "MSFT" and first.json()["status"] == "running"
+    second = c.post("/api/runs", json={"ticker": "META", "kind": "tot"}, headers=h)
+    assert second.status_code == 409 and "another LLM job" in second.json()["detail"]
+    assert c.app.state.ui.llm_lock.locked()            # reject would use the template lesson now
+    for e in r.go:
+        e.set()
+    jid = first.json()["job_id"]
+    for _ in range(200):
+        if c.get(f"/api/jobs/{jid}").json()["status"] != "running":
+            break
+        threading.Event().wait(0.01)
+    assert c.get(f"/api/jobs/{jid}").json()["status"] == "done"
+    assert not c.app.state.ui.llm_lock.locked()
+    third = c.post("/api/runs", json={"ticker": "META", "kind": "tot"}, headers=h)
+    assert third.status_code == 200
+    for e in r.go:
+        e.set()
+
+
+def test_sse_streams_spans_in_order_then_done(seeded, tmp_path):
+    r = StepRunner()
+    c, h, _ = _jobs_app(tmp_path, seeded, r)
+    jid = c.post("/api/runs", json={"ticker": "MSFT"}, headers=h).json()["job_id"]
+    for e in r.go:
+        e.set()
+    with c.stream("GET", f"/api/jobs/{jid}/events") as resp:
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        body = "".join(resp.iter_text())
+    ev = _events(body)
+    kinds = [k for k, _ in ev]
+    assert kinds[0] == "job" and kinds[-1] == "done"
+    assert ev[-1][1]["status"] == "done" and ev[-1][1]["result"]["outcome"] == "SELECTED"
+    span_ids = [d["span_id"] for k, d in ev if k == "span"]
+    assert list(dict.fromkeys(span_ids)) == ["s1", "s2", "s3"]          # first seen in span order
+    final = {d["span_id"]: d for k, d in ev if k == "span"}
+    assert all(final[s]["ended_at"] for s in ("s1", "s2", "s3"))       # completed versions arrived
+    assert [d["seq"] for k, d in ev if k == "guardrail"] == [1, 2, 3]
+    assert any(k == "tot" and d["nodes"] == 1 for k, d in ev)
+    for raw in ("12345678", "$12,500", UA):
+        assert raw not in body
+
+
+def test_stream_resends_a_span_when_it_completes():
+    job = type("J", (), {})()
+    job.status, job.runs = "running", {"multi_agent": "r1"}
+    job.view = lambda: {"status": job.status}
+    polls = [
+        ([{"run_id": "r1", "span_id": "s1", "ended_at": None, "llm_calls": 0}], [], 0),
+        ([{"run_id": "r1", "span_id": "s1", "ended_at": None, "llm_calls": 0}], [], 0),
+        ([{"run_id": "r1", "span_id": "s1", "ended_at": "t", "llm_calls": 2}], [], 0),
+    ]
+
+    def read(_):
+        if len(polls) == 1:
+            job.status = "done"
+        return polls.pop(0) if len(polls) > 1 else polls[0]
+    ev = _events("".join(stream(job, read, poll_s=0, sleep=lambda s: None)))
+    spans = [d for k, d in ev if k == "span"]
+    assert [s["ended_at"] for s in spans] == [None, "t"] and ev[-1][0] == "done"
+
+
+def test_a_failed_job_releases_the_lock_and_reports_the_error():
+    lock = threading.Lock()
+
+    def boom(*a):
+        raise RuntimeError("Ollama is not running")
+    m = JobManager(lock, lambda: None, boom)
+    j = m.start("multi_agent", "MSFT", TODAY)
+    for _ in range(200):
+        if j.status != "running":
+            break
+        threading.Event().wait(0.01)
+    assert j.status == "failed" and "Ollama is not running" in j.error and not lock.locked()
+
+
+def test_remasking_keeps_identifiers_and_links_working(seeded, tmp_path):
+    """Run, span and brief IDs contain long digit runs; masking them broke links and the ToT lookup."""
+    db, _, _, r1, _ = seeded
+    db.add_trace(r1, "summary", {"tot_run_id": "run-20261119-736848", "brief_id": "brf-20261119-770e2a"},
+                 name="multi_agent.state")
+    db.save_tot_nodes("run-20261119-736848", [{"id": "n3", "parent_id": None, "depth": 0, "status": "selected",
+                                               "score": 0.4, "prune_reason": "cost $12,500 total", "source": "llm",
+                                               "detail": {"numbers": {"credit": 347.5}}}])
+    db.conn.execute("INSERT INTO runs (run_id, kind, ticker, started_at) VALUES ('run-20261119-736848', 'tot', 'MSFT', 'x')")
+    c = _app(seeded, tmp_path, FakeMarket())
+    run = c.get(f"/api/runs/{r1}").json()
+    assert run["run"]["run_id"] == r1 and run["tot_run_id"] == "run-20261119-736848"
+    assert run["brief_id"] == "brf-20261119-770e2a" and run["spans"][0]["run_id"] == r1
+    assert run["spans"][0]["output_summary"]["note"].count("masked") == 2     # summaries still fully masked
+    tot = c.get("/api/runs/run-20261119-736848/tot").json()["nodes"][0]
+    assert tot["detail"]["numbers"]["credit"] == 347.5 and "$12,500" not in tot["prune_reason"]

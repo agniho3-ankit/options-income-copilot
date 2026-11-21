@@ -420,3 +420,44 @@ def test_run_agents_use_only_the_local_llm(pb):
     r, db = run(pb, llm=llm)
     assert "generator" in llm.calls and "critic" in llm.calls      # every agent call reached our client
     assert any(t["name"].startswith("crewai.") for t in db.trace(r.run_id))
+
+
+def test_spans_are_written_when_a_node_starts_and_completed_when_it_ends(pb):
+    """The live UI timeline needs the running node: its span row exists (ended_at NULL) while it runs."""
+    seen = []
+
+    class WatchingLLM(RoleLLM):
+        def chat(self, messages, **kw):
+            seen.append([(s["agent"], s["ended_at"]) for s in self._db.spans(self._db._run)])
+            return super().chat(messages, **kw)
+
+    db = Database(":memory:")
+    llm = WatchingLLM(critic=veto_first)
+    real_start = db.start_run
+
+    def start_run(*a, **k):
+        rid = real_start(*a, **k)
+        if a[0] == "multi_agent":
+            db._run = rid
+        return rid
+    db.start_run = start_run
+    llm._db = db
+    r = run_multi_agent(TICKER, sources=FakeSources(), pb=pb, as_of=AS_OF, llm=llm, db=db, masker=Masker(PV),
+                        portfolio_value=PV)
+    # while an LLM call was in flight, the calling node's span was already present and open
+    assert any(any(agent == "researcher" and ended is None for agent, ended in snap) for snap in seen)
+    spans = db.spans(r.run_id)
+    assert all(s["ended_at"] is not None for s in spans)          # all completed at the end
+    assert len({s["span_id"] for s in spans}) == len(spans)        # updated in place, never duplicated
+
+
+def test_metrics_ignore_a_span_that_is_still_running(pb):
+    from options_copilot.observability import metrics
+    db = Database(":memory:")
+    rid = db.start_run("multi_agent", TICKER, "fake", pb.sha256)
+    db.add_span(rid, "s1", None, "researcher", "one-way", "2026-11-20T10:00:00", None, None, 0, None, None)
+    assert metrics(db, pb)["latency_per_agent"] == {}
+    db.add_span(rid, "s1", None, "researcher", "one-way", "2026-11-20T10:00:00", "2026-11-20T10:00:05", 5000, 2,
+                None, None)
+    assert metrics(db, pb)["latency_per_agent"]["researcher"]["n"] == 1
+    assert len(db.spans(rid)) == 1

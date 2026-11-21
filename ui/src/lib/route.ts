@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 export type Route =
   | { screen: "today" }
   | { screen: "review"; id: string | null }
-  | { screen: "explore" }
+  | { screen: "explore"; id: string | null }
   | { screen: "positions" }
   | { screen: "journal" }
   | { screen: "lab" }
@@ -15,6 +15,7 @@ export function parse(hash: string): Route {
     case "review":
       return { screen: "review", id: id ? decodeURIComponent(id) : null };
     case "explore":
+      return { screen: "explore", id: id ? decodeURIComponent(id) : null };
     case "positions":
     case "journal":
     case "lab":

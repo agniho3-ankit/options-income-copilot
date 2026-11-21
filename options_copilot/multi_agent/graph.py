@@ -677,6 +677,15 @@ def _span(rt: Runtime, name: str, fn: Callable[[AgentState], dict]) -> Callable[
         parent = rt.session_span if name == "supervisor" else (rt.last_supervisor_span or rt.session_span)
         start, t0, calls0, err = _now(), time.monotonic(), rt.llm_calls, None
         tokens0, fb0 = rt.tokens, rt.fallbacks
+        pattern = PATTERN[name]
+        if name == "strategist" and state.get("strategist_done"):
+            pattern = "two-way"
+        elif name == "strategist":
+            pattern = "one-way + brainstorming"
+        # written now (ended_at NULL) so a live view can show the running node; completed below
+        rt.db.add_span(rt.db_run_id, span_id, parent, name, pattern, start, None, None, 0,
+                       rt.masker.value({"route": (state.get("route_log") or [None])[-1]}), None,
+                       ticker=rt.box.ticker, as_of=state.get("as_of"))
         if rt.guard is not None:
             rt.guard.span_id = span_id
         try:
@@ -690,11 +699,6 @@ def _span(rt: Runtime, name: str, fn: Callable[[AgentState], dict]) -> Callable[
                                                                     "strategist_done", "gate_done") else
                                                         (len(v) if isinstance(v, list) else type(v).__name__))
                                                     for k, v in out.items() if k not in ("budgets", "messages")}
-            pattern = PATTERN[name]
-            if name == "strategist" and state.get("strategist_done"):
-                pattern = "two-way"
-            elif name == "strategist":
-                pattern = "one-way + brainstorming"
             if name == "supervisor" and out is not None:
                 summary_out = {"next": out["route_log"][-1]}
             row = {"span_id": span_id, "parent_id": parent, "agent": name, "pattern": pattern, "started_at": start,

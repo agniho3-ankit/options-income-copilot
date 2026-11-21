@@ -107,3 +107,26 @@ export type TradeWindow = {
   x_domain: [string, string]; y_domain: [number, number];
   freshness: { stale: boolean; age_s: number; error?: string };
 };
+
+// --- Explore -------------------------------------------------------------------------------
+
+export type Span = {
+  run_id: string; span_id: string; parent_id: string | null; agent: string; pattern: string | null;
+  started_at: string; ended_at: string | null; duration_ms: number | null; llm_calls: number;
+  decision?: string | null; error?: string | null;
+};
+export type GuardEvent = {
+  run_id: string; seq: number; span_id: string | null; guardrail: string; stage: string; decision: string;
+  signal: string | null; reason: string | null; created_at: string;
+};
+export type JobResult = { run_id?: string; outcome?: string; brief_id?: string | null; tot_run_id?: string | null;
+  reasons?: string[]; llm_calls?: number; latency_ms?: number; summary?: string };
+export type Job = {
+  job_id: string; kind: "multi_agent" | "tot"; ticker: string; as_of: string; status: "running" | "done" | "failed";
+  created_at: string; finished_at: string | null; runs: Record<string, string>; result: JobResult | null; error: string | null;
+};
+export type RunRow = { run_id: string; kind: string; ticker: string; started_at: string; finished_at: string | null; outcome: string | null };
+export type RunView = {
+  run: RunRow & Record<string, unknown>; spans: Span[]; guardrail_events: GuardEvent[];
+  tot_run_id: string | null; brief_id: string | null; reasons?: string[];
+};

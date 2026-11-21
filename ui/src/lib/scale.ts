@@ -63,3 +63,40 @@ export function spreadLabels(ys: number[], gap: number): number[] {
 export function bound(v: number | null, fallback: number): number {
   return v === null ? fallback : v;
 }
+
+/** Map ISO timestamps (with time of day) onto pixels. */
+export function instantScale(domain: [number, number], range: [number, number]): (iso: string | number) => number {
+  const s = linear(domain, range);
+  return (t: string | number) => s(typeof t === "number" ? t : Date.parse(t));
+}
+
+export function instant(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? null : t;
+}
+
+/** Elapsed m:ss between two instants (display only). */
+export function elapsed(from: number, to: number): string {
+  const s = Math.max(0, Math.round((to - from) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** The time window a set of spans covers, ending at `now` while any is still open. */
+export function spanWindow(spans: { started_at: string; ended_at: string | null }[], now: number): [number, number] {
+  const starts = spans.map((s) => instant(s.started_at)).filter((t): t is number => t !== null);
+  const ends = spans.map((s) => instant(s.ended_at) ?? now);
+  if (starts.length === 0) return [now - 1000, now];
+  const lo = Math.min(...starts);
+  return [lo, Math.max(lo + 1000, ...ends)];
+}
+
+/** [x, width] for a bar from x0 to x1, at least `min` pixels wide so short spans stay visible. */
+export function bar(x0: number, x1: number, min = 3): [number, number] {
+  return [x0, Math.max(min, x1 - x0)];
+}
+
+/** Top of row `i` for rows `h` pixels tall. */
+export function rowTop(i: number, h: number, offset = 0): number {
+  return offset + i * h;
+}

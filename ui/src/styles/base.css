@@ -198,3 +198,40 @@ textarea { font: inherit; color: var(--text); background: var(--surface-2); bord
 .dialog { background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: var(--space-6); max-width: 520px; width: 100%; }
 .dialog h2 { margin: 0 0 var(--space-3); font-size: 16px; font-weight: 600; }
 .dialog p { margin: 0 0 var(--space-3); }
+
+/* Explore */
+.explore { display: grid; gap: var(--space-4); }
+.start-form { display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: flex-end; }
+.start-form .kind { border: 0; padding: 0; margin: 0; display: grid; gap: 4px; }
+.start-form .kind label { display: flex; gap: 6px; align-items: center; }
+input.ticker-input { font-family: var(--font-mono); text-transform: uppercase; width: 8rem; color: var(--text); background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 8px; }
+.outcome { margin-top: var(--space-3); }
+.outcome p { margin: 0 0 var(--space-2); }
+.timeline { margin: var(--space-3) 0 0; }
+.timeline-svg { width: 100%; height: auto; display: block; font-size: 12px; }
+.timeline-svg text { fill: var(--text-muted); }
+.timeline-svg .grid { stroke: var(--line); }
+.span-bar rect { fill: var(--accent); fill-opacity: 0.55; }
+.span-bar.span-error rect { fill: var(--block); }
+.span-bar.span-open rect { fill-opacity: 0.85; animation: pulse 1.4s ease-in-out infinite; }
+.span-bar .span-label { fill: var(--accent-ink); font-size: 11px; }
+.marker-shape { font-size: 12px; }
+.marker-shape.status-pass { fill: var(--pass); }
+.marker-shape.status-caution { fill: var(--caution); }
+.marker-shape.status-block { fill: var(--block); }
+.marker-shape.status-info { fill: var(--info); }
+@keyframes pulse { 50% { fill-opacity: 0.45; } }
+.tot-scroll { max-height: 560px; overflow: auto; border-radius: var(--radius); }
+.tot-svg { width: 100%; height: auto; display: block; font-size: 11px; }
+.tot-cell { cursor: pointer; }
+.tot-cell rect { fill: var(--surface-2); stroke: var(--line); }
+.tot-cell text { fill: var(--text); pointer-events: none; }
+.tot-cell.tot-pruned rect { fill: var(--bg); stroke-dasharray: 3 3; }
+.tot-cell.tot-pruned text { fill: var(--text-muted); }
+.tot-cell.tot-selected rect { stroke: var(--pass); stroke-width: 2; fill: var(--surface); }
+.tot-cell.tot-picked rect { stroke: var(--accent); stroke-width: 2; }
+.tot-cell:focus { outline: none; }
+.tot-cell:focus-visible rect { stroke: var(--focus); stroke-width: 2; }
+.tot-detail { margin-top: var(--space-3); padding: var(--space-3); background: var(--surface-2); border-radius: var(--radius); }
+.tot-detail p { margin: 0 0 var(--space-2); }
+.tot-cell text.tot-flag { fill: var(--caution); }

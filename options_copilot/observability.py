@@ -41,7 +41,8 @@ def metrics(db: Database, pb: Playbook, since: str | None = None) -> dict:
     judge_runs = guard.get("judge", Counter())
     judge_rate = _rate(judge_runs["flag"], sum(judge_runs.values()))
 
-    spans = c.execute("SELECT s.* FROM spans s JOIN runs r USING (run_id) WHERE r.started_at >= ?", (since,)).fetchall()
+    spans = c.execute("SELECT s.* FROM spans s JOIN runs r USING (run_id) WHERE r.started_at >= ? "
+                      "AND s.ended_at IS NOT NULL", (since,)).fetchall()   # a running span has no duration yet
     lat: dict[str, list[int]] = defaultdict(list)
     calls_per_run: Counter = Counter()
     fallbacks = errors = 0
