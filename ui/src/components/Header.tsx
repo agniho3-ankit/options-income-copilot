@@ -20,7 +20,9 @@ export function Header({ route, theme, onToggleTheme, searchRef, onShortcuts }: 
   const [q, setQ] = useState("");
   return (
     <header className="header">
-      <span className="brand">Options Income Copilot</span>
+      <a className="brand" href="#/" aria-current={route.screen === "home" ? "page" : undefined}>
+        Options Income Copilot
+      </a>
       <nav className="nav" aria-label="Screens">
         {NAV.map((n) => (
           <a key={n.screen} href={n.href} aria-current={route.screen === n.screen ? "page" : undefined}>{n.label}</a>

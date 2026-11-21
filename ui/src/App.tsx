@@ -5,6 +5,7 @@ import { SHORTCUTS, useShortcuts } from "./lib/keys";
 import { useRoute } from "./lib/route";
 import { applyTheme, initialTheme, type Theme } from "./lib/theme";
 import { Explore } from "./screens/Explore";
+import { Home } from "./screens/Home";
 import { Journal } from "./screens/Journal";
 import { Lab } from "./screens/Lab";
 import { Playbook } from "./screens/Playbook";
@@ -40,7 +41,8 @@ export function App() {
       <Header route={route} theme={theme} onToggleTheme={toggle} searchRef={search}
         onShortcuts={() => setSheet(true)} />
       <main className="main" id="main" tabIndex={-1}>
-        {route.screen === "today" ? <Today filter={route.filter} />
+        {route.screen === "home" ? <Home />
+          : route.screen === "today" ? <Today filter={route.filter} />
           : route.screen === "review" ? <Review key={route.id ?? "none"} id={route.id} />
           : route.screen === "explore" ? <Explore runId={route.id} />
           : route.screen === "positions" ? <Positions />

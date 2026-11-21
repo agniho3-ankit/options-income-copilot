@@ -520,6 +520,10 @@ on `127.0.0.1:5173`; it proxies `/api` to the API. Tests: `pytest -q` and `(cd u
 
 ### Screens
 
+The app opens on **Home** (click the name in the header to return): a brief about the project, live
+status at a glance, what each tab is for, how a trade reaches you, the rules that cannot be bent,
+the agentic techniques used, keyboard shortcuts, a glossary, and data and privacy notes.
+
 | Screen | What it shows |
 |---|---|
 | **Today** | The review queue as lanes: escalated, look closely, standard, then info items (BLOCK / INSUFFICIENT_EVIDENCE runs with the reason and the next step), then deferred briefs. Each card shows the trade, the score and the top three signals in plain words. |

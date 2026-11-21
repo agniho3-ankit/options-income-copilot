@@ -104,6 +104,7 @@ describe("queue navigation", () => {
 describe("app shell", () => {
   it("? opens the shortcut sheet and / focuses the ticker search", async () => {
     const user = userEvent.setup();
+    window.location.hash = "#/today";
     render(<App />);
     await screen.findByTestId("summary");
     await user.keyboard("?");
@@ -118,6 +119,7 @@ describe("app shell", () => {
   });
 
   it("has a skip link to the main content and every control has a name", async () => {
+    window.location.hash = "#/today";
     render(<App />);
     await screen.findByTestId("summary");
     const skip = screen.getByRole("link", { name: "Skip to content" });

@@ -57,6 +57,7 @@ describe("Today", () => {
 describe("App shell", () => {
   it("always shows the Paper only marker and a theme toggle", async () => {
     mockFetch({ "/api/queue": QUEUE });
+    window.location.hash = "#/today";
     render(<App />);
     expect(screen.getByText("Paper only")).toBeVisible();
     expect(document.documentElement.dataset.theme).toBe("dark");
