@@ -695,3 +695,21 @@ def test_journal_route_returns_monthly_summaries_from_journal_py(client, seeded)
     from options_copilot.journal import metrics
     assert j["months"] == [metrics(db.journal(), "2026-10")] and j["all"] == metrics(db.journal())
     assert j["months"][0]["exit_rules"] == {"r1_profit_target": 1}
+
+
+# --- slice 7: lab and playbook ----------------------------------------------------------------
+
+def test_lab_route_reads_saved_results_and_runs_nothing(client):
+    before = len(client.app.state.ui.main_db.conn.execute("SELECT * FROM runs").fetchall())
+    lab = client.get("/api/lab").json()
+    assert lab["sources"]["eval"] == "eval_2026-11-16_x3.json" and "eval --repeats" in lab["run"]["eval_command"]
+    assert len(client.app.state.ui.main_db.conn.execute("SELECT * FROM runs").fetchall()) == before
+    assert client.app.state.ui.jobs.active() is None
+
+
+def test_playbook_lists_key_thresholds_from_the_loaded_file(client, seeded):
+    _, pb, *_ = seeded
+    p = client.get("/api/playbook").json()
+    keys = {k["path"]: k["value"] for k in p["key_thresholds"]}
+    assert keys["entry.pop_min"] == pb["entry.pop_min"] and keys["management.r2_roll.dte_below"] == 21
+    assert p["editable_by"] == "owner only, in the file" and p["sha256"] == pb.sha256

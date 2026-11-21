@@ -169,8 +169,21 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
 
     @app.get("/api/playbook")
     def playbook() -> dict:
+        keys = []
+        for path, label, unit in KEY_THRESHOLDS:
+            try:
+                keys.append({"path": path, "label": label, "unit": unit, "value": _thaw(st.pb[path])})
+            except KeyError:
+                continue
         return {"version": st.pb.version, "sha256": st.pb.sha256, "source": st.pb.source,
-                "editable_by": "owner only, in the file", "tree": _thaw(st.pb.tree)}
+                "editable_by": "owner only, in the file", "key_thresholds": keys, "tree": _thaw(st.pb.tree)}
+
+    @app.get("/api/lab")
+    def lab() -> dict:
+        """Saved evaluation evidence (lab.build): nothing is run from here."""
+        from ..lab import build
+        with st.db() as db:
+            return out(build(db, st.outputs_dir))
 
     # --- the review queue and briefs -----------------------------------------------------------
 
@@ -451,6 +464,24 @@ def trade_summary(kind: str, p: dict) -> dict:
         new = p["new"].get("proposal") or {}
         out["new"] = {"strategy": new.get("strategy"), "legs": _legs(new.get("legs")), "expiry": new.get("expiry")}
     return out
+
+
+# The thresholds the Playbook screen lists first: (dotted path, label, unit). Values are read live.
+KEY_THRESHOLDS: tuple[tuple[str, str, str], ...] = (
+    ("entry.pop_min", "Minimum probability of profit", "fraction"),
+    ("entry.position_risk_pct.block", "Position risk block", "%"),
+    ("entry.portfolio_heat_pct.block", "Portfolio heat cap", "%"),
+    ("entry.earnings.block_within_days", "Block when earnings are within", "days"),
+    ("entry.dte_min", "Minimum days to expiry", "days"),
+    ("entry.dte_max", "Maximum days to expiry", "days"),
+    ("entry.open_interest_min", "Minimum open interest at each short strike", "contracts"),
+    ("builder.short_delta_min", "Short delta, lowest", "delta"),
+    ("builder.short_delta_max", "Short delta, highest", "delta"),
+    ("management.r1_profit_target_pct", "Take profit at", "% of max profit"),
+    ("management.r2_roll.dte_below", "Roll below", "DTE"),
+    ("management.r3_stop_loss.loss_credit_multiple", "Stop loss at", "x credit"),
+    ("guardrails.min_confidence", "Confidence floor", "fraction"),
+)
 
 
 class RunBody(BaseModel):

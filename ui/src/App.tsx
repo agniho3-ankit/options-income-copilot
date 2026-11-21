@@ -1,16 +1,15 @@
 import { useState } from "react";
 import { Header } from "./components/Header";
-import { useRoute, type Route } from "./lib/route";
+import { useRoute } from "./lib/route";
 import { applyTheme, initialTheme, type Theme } from "./lib/theme";
 import { Explore } from "./screens/Explore";
 import { Journal } from "./screens/Journal";
+import { Lab } from "./screens/Lab";
+import { Playbook } from "./screens/Playbook";
 import { Positions } from "./screens/Positions";
 import { Review } from "./screens/Review";
 import { Today } from "./screens/Today";
 
-const LATER: Record<Exclude<Route["screen"], "today" | "review" | "explore" | "positions" | "journal">, string> = {
-  lab: "slice 7", playbook: "slice 7",
-};
 
 export function App() {
   const route = useRoute();
@@ -33,7 +32,8 @@ export function App() {
           : route.screen === "explore" ? <Explore runId={route.id} />
           : route.screen === "positions" ? <Positions />
           : route.screen === "journal" ? <Journal />
-          : <p className="empty">This screen is not built yet ({LATER[route.screen]}).</p>}
+          : route.screen === "lab" ? <Lab />
+          : <Playbook />}
       </main>
     </div>
   );

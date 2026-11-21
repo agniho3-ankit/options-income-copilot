@@ -160,3 +160,38 @@ export type JournalSummary = {
   annualized_return_pct: number | null; avg_return_on_risk_pct: number | null; exit_rules: Record<string, number>;
 };
 export type Journal = { rows: JournalRow[]; all: JournalSummary; months: JournalSummary[] };
+
+// --- Lab and Playbook -----------------------------------------------------------------------
+
+export type Aggregate = Partial<Record<"cases" | "runs" | "verdict_accuracy" | "outcome_accuracy" | "unsafe_passed" |
+  "false_blocks" | "false_block_rate" | "verdict_consistency" | "outcome_consistency" | "paraphrase_agreement" |
+  "latency_p50_s" | "latency_p95_s" | "llm_calls_mean" | "builds_mean" | "fallbacks", number>>;
+export type Bin = { bin: string; n: number; mean_conf: number | null; accuracy: number | null };
+export type Calibration = { n: number; ece: number | null; brier: number | null; reliability: Bin[] };
+export type Cell = { value: number | null; delta: number | null; direction: string; level: number };
+export type Lab = {
+  after_floor: Aggregate | null; before_floor: Aggregate | null; before_note: string | null;
+  calibration: Record<string, Calibration> | null; repeats: number | null;
+  cases: { case: string; runs?: number; verdict_accuracy?: number; outcome_accuracy?: number; unsafe_passed?: number;
+    false_blocks?: number; verdicts?: Record<string, number>; outcomes?: Record<string, number> }[];
+  ablation: { columns: { key: string; label: string; higher_is_better: boolean | null }[];
+    rows: { config: string; cells: Record<string, Cell> }[]; baseline: string | null; note: string | null };
+  sources: { eval: string | null; before_floor: string | null; ablation: string | null;
+    stored_evals: { eval_id: string; created_at: string; mode: string }[] };
+  run: { warning: string; eval_command: string; ablation_command: string };
+};
+export type Metrics = {
+  db: string; since: string | null; runs_by_outcome: Record<string, Record<string, number>>;
+  escalation_rate: Record<string, number | null>; review_items: number;
+  guardrails: Record<string, Record<string, number>>;
+  latest_eval_unsafe_passed: { eval_id: string; created_at: string; unsafe_passed: number } | null;
+  latency_per_agent: Record<string, { n: number; p50_s: number | null; p95_s: number | null }>;
+  llm_calls_per_run: { runs: number; mean: number | null; p95: number | null };
+  claude_fallbacks: number; span_errors: number; reject_codes: Record<string, number>; judge_flag_rate: number | null;
+  landmine_confidence: { n: number; bins: Record<string, number> };
+};
+export type PlaybookView = {
+  version: number; sha256: string; source: string; editable_by: string;
+  key_thresholds: { path: string; label: string; unit: string; value: unknown }[];
+  tree: Record<string, unknown>;
+};

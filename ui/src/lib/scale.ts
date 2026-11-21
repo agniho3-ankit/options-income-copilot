@@ -100,3 +100,9 @@ export function bar(x0: number, x1: number, min = 3): [number, number] {
 export function rowTop(i: number, h: number, offset = 0): number {
   return offset + i * h;
 }
+
+/** Bar lengths (percent of the longest) for a set of counts: display geometry only. */
+export function barLengths(counts: number[]): number[] {
+  const top = Math.max(1, ...counts);
+  return counts.map((n) => Math.round((n / top) * 1000) / 10);
+}
