@@ -45,13 +45,22 @@ def metrics(rows: list[dict[str, Any]], month: str | None = None) -> dict[str, A
     out: dict[str, Any] = {"month": month or "all", "total_trades": len(rows), "closed_trades": len(closed),
                            "active_trades": len(rows) - len(closed), "total_pnl": round(sum(r["pnl"] for r in closed), 2),
                            "win_rate_pct": None, "avg_days_held": None, "avg_return_pct": None,
-                           "annualized_return_pct": None, "synthetic": True}
+                           "annualized_return_pct": None, "avg_return_on_risk_pct": None, "exit_rules": {},
+                           "synthetic": True}
     if closed:
         days = sum(r["days_held"] for r in closed) / len(closed)
         avg = sum(r["pnl_pct"] for r in closed) / len(closed)
         out.update(win_rate_pct=round(sum(r["pnl"] > 0 for r in closed) / len(closed) * 100, 1),
                    avg_days_held=round(days, 1), avg_return_pct=round(avg, 2),
                    annualized_return_pct=round(avg * 365 / max(days, 1), 1))
+        ror = [r["return_on_risk_pct"] for r in closed if r.get("return_on_risk_pct") is not None]
+        if ror:
+            out["avg_return_on_risk_pct"] = round(sum(ror) / len(ror), 2)
+        rules: dict[str, int] = {}
+        for r in closed:
+            key = r.get("exit_rule") or "unrecorded"
+            rules[key] = rules.get(key, 0) + 1
+        out["exit_rules"] = dict(sorted(rules.items(), key=lambda kv: (-kv[1], kv[0])))
     return out
 
 

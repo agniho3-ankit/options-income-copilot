@@ -130,3 +130,33 @@ export type RunView = {
   run: RunRow & Record<string, unknown>; spans: Span[]; guardrail_events: GuardEvent[];
   tot_run_id: string | null; brief_id: string | null; reasons?: string[];
 };
+
+// --- Positions and Journal -------------------------------------------------------------------
+
+export type Track = {
+  rule: string; label: string; value: string; target: string; progress_pct: number | null;
+  state: "ok" | "due" | "breach" | "unknown"; action: string | null; reason: string;
+};
+export type PositionRow = {
+  position_id: string; ticker: string; strategy: string; opened_on: string; expiry: string; contracts: number;
+  entry_credit: number; entry_max_loss: number; legs: { side: string; option_type: string; strike: number }[];
+  pending_brief: string | null; spot?: number; close_cost?: number | null; profit_pct?: number | null;
+  tracks: Track[]; not_evaluated?: string[]; as_of?: string; error?: string;
+  freshness?: { stale: boolean; age_s: number; error?: string };
+};
+export type Heat = { pct: number; cap_pct: number; warn_pct: number; gauge_pct: number; over_cap: boolean; review: string | null };
+export type Positions = { as_of: string; positions: PositionRow[]; heat: Heat };
+
+export type JournalRow = {
+  position_id: string; date_opened: string; ticker: string; strategy: string; short_put: number | null;
+  short_call: number | null; long_put: number | null; long_call: number | null; dte: number | null;
+  entry_credit: number | null; entry_max_loss: number | null; earnings_note: string | null; date_closed: string | null;
+  close_cost: number | null; pnl: number | null; pnl_pct: number | null; return_on_risk_pct: number | null;
+  days_held: number | null; annualized_pct: number | null; exit_rule: string | null; notes: string | null;
+};
+export type JournalSummary = {
+  month: string; total_trades: number; closed_trades: number; active_trades: number; total_pnl: number;
+  win_rate_pct: number | null; avg_days_held: number | null; avg_return_pct: number | null;
+  annualized_return_pct: number | null; avg_return_on_risk_pct: number | null; exit_rules: Record<string, number>;
+};
+export type Journal = { rows: JournalRow[]; all: JournalSummary; months: JournalSummary[] };

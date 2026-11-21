@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
-KINDS = ("multi_agent", "tot")
+KINDS = ("multi_agent", "tot", "monitor")
 
 
 @dataclass
@@ -154,7 +154,7 @@ def stream(job: Job, read: Callable[[list[str]], tuple[list[dict], list[dict], i
 # --- the real runner (live data, local LLM) ---------------------------------------------------
 
 def live_runner(settings: Any, pb: Any) -> Runner:
-    """Runs exactly what the CLI's `ma` and `tot` commands run, with the local model only."""
+    """Runs exactly what the CLI's `ma`, `tot` and `monitor` commands run, with the local model only."""
     def run(kind: str, ticker: str, as_of: date, db: Any) -> dict:
         from ..agent_tools import ToolBox
         from ..broker import open_positions
@@ -172,6 +172,16 @@ def live_runner(settings: Any, pb: Any) -> Runner:
         sources = CachedSources(LiveSources(pb, as_of, Market(), edgar, store, llm))
         masker = Masker(settings.synthetic_portfolio_value)
         losses = tuple(p.entry_max_loss * p.contracts for p in open_positions(db))
+        if kind == "monitor":
+            from ..monitor import run_monitor
+            run_id, items, summary = run_monitor(db, sources, pb, as_of, llm=llm, masker=masker,
+                                                 portfolio_value=settings.synthetic_portfolio_value, store=store,
+                                                 tot_llm=llm)
+            return {"run_id": run_id, "outcome": "done", "brief_id": None, "summary": summary,
+                    "items": [{"position_id": i.position_id, "ticker": i.ticker,
+                               "action": i.decision.action.value if i.decision.action else "hold",
+                               "chosen_by": i.decision.chosen_by, "brief_id": i.brief_id, "note": i.note}
+                              for i in items]}
         if kind == "multi_agent":
             from ..multi_agent.runner import run_multi_agent
             r = run_multi_agent(ticker, sources=sources, pb=pb, as_of=as_of, llm=llm, db=db, masker=masker,

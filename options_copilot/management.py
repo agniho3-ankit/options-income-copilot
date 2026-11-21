@@ -185,3 +185,86 @@ def heat_review(heat_pct: float, as_of: date, pb: Playbook) -> Trigger | None:
     if heat_pct > pb["management.r8_heat.max_pct"]:
         return Trigger("r8_heat", Action.REVIEW_WEAKEST, f"portfolio heat {heat_pct:.1f}% on {weekday}")
     return None
+
+
+# --- rule tracks for the UI's Positions screen (UI phase) ---------------------------------
+
+def _progress(value: float, target: float) -> float:
+    """Percent of the way to `target`, clamped to 0..100 (for a progress bar)."""
+    if target <= 0:
+        return 100.0
+    return round(min(max(value / target, 0.0), 1.0) * 100, 1)
+
+
+def rule_tracks(pos: Position, snap: Snapshot, ev: Evaluation, pb: Playbook) -> list[dict]:
+    """One row per management rule: how far the position is toward the rule's trigger.
+
+    Every value is computed here from the snapshot and the playbook; the UI only draws it.
+    `state` is "ok" (not triggered), "due" (the rule says act), "breach" (a stop or emergency
+    exit), or "unknown" (the data the rule needs is missing; never treated as safe)."""
+    m = lambda key: pb[f"management.{key}"]  # noqa: E731
+    fired = {t.rule: t for t in ev.triggers}
+    missing = set(ev.not_evaluated)
+    rows: list[dict] = []
+
+    def row(rule: str, label: str, *, value: str, target: str, progress: float | None, breach: bool = False,
+            note: str = "") -> None:
+        t = fired.get(rule)
+        if rule in missing:
+            state = "unknown"
+        elif t is not None:
+            state = "breach" if breach else "due"
+        else:
+            state = "ok"
+        rows.append({"rule": rule, "label": label, "value": value, "target": target,
+                     "progress_pct": None if rule in missing else progress, "state": state,
+                     "action": t.action.value if t else None, "reason": t.reason if t else note})
+
+    pp = ev.profit_pct
+    goal = m("r1_profit_target_pct")
+    row("r1_profit_target", "Profit taken", value="–" if pp is None else f"{pp:.1f}%", target=f"{goal}%",
+        progress=None if pp is None else _progress(pp, goal))
+
+    dte = (pos.expiry - snap.as_of).days
+    dte_open = (pos.expiry - pos.opened_on).days
+    roll_at = m("r2_roll.dte_below")
+    row("r2_roll", "Days to expiry", value=f"{dte} DTE", target=f"roll below {roll_at}",
+        progress=_progress(dte_open - dte, dte_open - roll_at) if dte_open > roll_at else 100.0)
+
+    limit = m("r3_stop_loss.loss_credit_multiple")
+    if snap.close_cost is None:
+        row("r3_stop_loss", "Loss vs credit", value="–", target=f"stop at {limit:g}x", progress=None)
+    else:
+        mult = (snap.close_cost - pos.entry_credit) / pos.entry_credit
+        row("r3_stop_loss", "Loss vs credit", value=f"{max(mult, 0.0):.2f}x", target=f"stop at {limit:g}x",
+            progress=_progress(mult, limit), breach=True)
+
+    if pos.entry_spot is None or pos.entry_iv is None:
+        row("r4_big_move", "Move vs 1σ", value="–", target="1σ band", progress=None)
+    else:
+        band = m("r4_big_move.sigma") * one_sigma(pos.entry_spot, pos.entry_iv, (snap.as_of - pos.opened_on).days)
+        move = snap.spot - pos.entry_spot
+        row("r4_big_move", "Move vs 1σ", value=f"{move:+.2f}", target=f"±{band:.2f}", progress=_progress(abs(move), band))
+
+    if snap.earnings_date is None:
+        row("r5_earnings", "Earnings", value="none reported" if snap.earnings_known_none else "unknown",
+            target=f"close within {m('r5_earnings.close_all_within_days')} days", progress=None)
+    else:
+        days = (snap.earnings_date - snap.as_of).days
+        row("r5_earnings", "Earnings", value=f"in {days} days ({snap.earnings_date.isoformat()})",
+            target=f"close within {m('r5_earnings.close_all_within_days')} days", progress=None)
+
+    for rule, label in (("r6_iv_crush", "IV crush"), ("r7_ex_dividend", "Ex-dividend"),
+                        ("emergency_sector", "Sector drop"), ("emergency_insider", "Insider sale")):
+        t = fired.get(rule)
+        if t is not None or rule in missing or rule in ("r6_iv_crush", "r7_ex_dividend"):
+            row(rule, label, value="triggered" if t else ("–" if rule in missing else "clear"), target="",
+                progress=None, breach=rule.startswith("emergency"))
+    return rows
+
+
+def heat_gauge(heat_pct: float, pb: Playbook) -> dict:
+    """Portfolio heat against the R8 cap, with the fill level for a gauge (0..100)."""
+    cap = pb["management.r8_heat.max_pct"]
+    return {"pct": heat_pct, "cap_pct": cap, "warn_pct": pb["entry.portfolio_heat_pct.warn"],
+            "gauge_pct": _progress(heat_pct, cap), "over_cap": heat_pct > cap}

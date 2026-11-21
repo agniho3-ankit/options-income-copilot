@@ -604,3 +604,94 @@ def test_remasking_keeps_identifiers_and_links_working(seeded, tmp_path):
     assert run["spans"][0]["output_summary"]["note"].count("masked") == 2     # summaries still fully masked
     tot = c.get("/api/runs/run-20261119-736848/tot").json()["nodes"][0]
     assert tot["detail"]["numbers"]["credit"] == 347.5 and "$12,500" not in tot["prune_reason"]
+
+
+# --- slice 6: positions, journal, monitor -----------------------------------------------------
+
+from agent_fakes import AS_OF as FAKE_AS_OF, EXP as FAKE_EXP, FakeSources  # noqa: E402
+from options_copilot.models import OptionLeg, OptionType, Position, Side, Strategy, to_jsonable  # noqa: E402
+
+
+def _open_position(db, pid="pos-1"):
+    legs = (OptionLeg(OptionType.PUT, Side.SHORT, 92.0, FAKE_EXP, 2.0, 2.1),
+            OptionLeg(OptionType.PUT, Side.LONG, 86.0, FAKE_EXP, 1.28, 1.38))
+    pos = Position(pid, "MSFT", Strategy.PUT_CREDIT_SPREAD, legs, FAKE_AS_OF, 72.0, 528.0, entry_spot=100.0,
+                   entry_iv=0.30)
+    db.save_position(pid, None, "MSFT", "open", FAKE_AS_OF.isoformat(), to_jsonable(pos))
+    return pos
+
+
+class CountingSources(FakeSources):
+    def __init__(self, fail=False):
+        super().__init__()
+        self.fail, self.calls = fail, 0
+
+    def ticker_data(self, ticker):
+        self.calls += 1
+        if self.fail:
+            raise ConnectionError("offline")
+        return super().ticker_data(ticker)
+
+
+def _pos_app(tmp_path, seeded, sources, today=FAKE_AS_OF + timedelta(days=10)):
+    _, pb, settings, *_ = seeded
+    path = tmp_path / "pos.db"
+    main = Database(path)
+    _open_position(main)
+    app = create_app(settings, pb, main_db=main, outputs_dir=tmp_path, market_factory=lambda: FakeMarket(),
+                     today=lambda: today, llm_factory=lambda: None, store_factory=lambda: FakeStore(),
+                     job_runner=lambda *a: {"outcome": "done"}, db_factory=lambda: Database(path),
+                     sources_factory=lambda day: sources)
+    return TestClient(app, base_url=BASE), main
+
+
+def test_positions_show_python_rule_tracks_and_heat(seeded, tmp_path):
+    from options_copilot.management import Snapshot, evaluate, heat_gauge, rule_tracks
+    from options_copilot.monitor import snapshot
+    _, pb, *_ = seeded
+    src = CountingSources()
+    c, main = _pos_app(tmp_path, seeded, src)
+    body = c.get("/api/positions").json()
+    p = body["positions"][0]
+    assert p["position_id"] == "pos-1" and p["freshness"]["stale"] is False
+    pos = _open_position(Database(":memory:"))
+    snap, _ = snapshot(pos, FakeSources(), FAKE_AS_OF + timedelta(days=10), main, pb)
+    expected = rule_tracks(pos, snap, evaluate(pos, snap, pb), pb)
+    assert p["tracks"] == expected                                     # values straight from management.py
+    assert {t["rule"] for t in p["tracks"]} >= {"r1_profit_target", "r2_roll", "r3_stop_loss", "r4_big_move"}
+    assert body["heat"]["pct"] == 0.528 and body["heat"] == {**heat_gauge(0.528, pb), "review": None}
+    c.get("/api/positions")
+    assert src.calls == 1                                              # second view served from the cache
+
+
+def test_positions_with_no_live_data_show_an_error_not_a_guess(seeded, tmp_path):
+    c, _ = _pos_app(tmp_path, seeded, CountingSources(fail=True))
+    p = c.get("/api/positions").json()["positions"][0]
+    assert p["tracks"] == [] and "live data unavailable" in p["error"]
+    assert "profit_pct" not in p
+
+
+def test_positions_route_is_read_only(seeded, tmp_path):
+    c, main = _pos_app(tmp_path, seeded, CountingSources())
+    before = (len(main.tickets()), [r["status"] for r in main.positions()], len(main.briefs()))
+    c.get("/api/positions")
+    assert (len(main.tickets()), [r["status"] for r in main.positions()], len(main.briefs())) == before
+
+
+def test_monitor_runs_as_a_background_job(seeded, tmp_path):
+    c, _ = _pos_app(tmp_path, seeded, CountingSources())
+    h = {**ORIGIN, "X-CSRF-Token": c.get("/api/session").json()["csrf_token"]}
+    r = c.post("/api/runs", json={"kind": "monitor"}, headers=h)
+    assert r.status_code == 200 and r.json()["kind"] == "monitor" and r.json()["ticker"] == "ALL"
+    assert c.post("/api/runs", json={"kind": "multi_agent"}, headers=h).status_code in (409, 422)
+
+
+def test_journal_route_returns_monthly_summaries_from_journal_py(client, seeded):
+    db, *_ = seeded
+    db.save_journal({"position_id": "p1", "date_opened": "2026-10-01", "ticker": "MSFT", "strategy": "put_credit_spread",
+                     "date_closed": "2026-10-20", "pnl": 100.0, "pnl_pct": 50.0, "return_on_risk_pct": 25.0,
+                     "days_held": 19, "exit_rule": "r1_profit_target", "entry_credit": 200.0, "entry_max_loss": 400.0})
+    j = client.get("/api/journal").json()
+    from options_copilot.journal import metrics
+    assert j["months"] == [metrics(db.journal(), "2026-10")] and j["all"] == metrics(db.journal())
+    assert j["months"][0]["exit_rules"] == {"r1_profit_target": 1}

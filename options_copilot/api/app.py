@@ -86,6 +86,9 @@ class AppState:
     llm_lock: threading.Lock = field(default_factory=threading.Lock)   # one LLM job at a time
     _store: Any = None
     jobs: Any = None                                 # api.jobs.JobManager
+    db_factory: Callable[[], Any] | None = None      # a separate connection for slow reads
+    sources_factory: Callable[[date], Any] | None = None   # live market sources for Positions
+    positions_cache: dict = field(default_factory=dict)    # position_id -> (time, row)
     poll_s: float = 0.5
 
     def store(self) -> Any:
@@ -113,7 +116,7 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                market_factory: Callable[[], Any] | None = None, today: Callable[[], date] = date.today,
                llm_factory: Callable[[], Any] | None = None, store_factory: Callable[[], Any] | None = None,
                job_runner: Callable[..., dict] | None = None, db_factory: Callable[[], Any] | None = None,
-               poll_s: float = 0.5) -> FastAPI:
+               poll_s: float = 0.5, sources_factory: Callable[[date], Any] | None = None) -> FastAPI:
     if market_factory is None:
         def market_factory():
             from ..market import Market
@@ -125,8 +128,9 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                   llm_factory=llm_factory or (lambda: _local_llm(settings)),
                   store_factory=store_factory or (lambda: _chroma_store(settings)), poll_s=poll_s)
     from .jobs import JobManager, live_runner
-    st.jobs = JobManager(st.llm_lock, db_factory or (lambda: Database(settings.db_path)),
-                         job_runner or live_runner(settings, pb))
+    st.db_factory = db_factory or (lambda: Database(settings.db_path))
+    st.sources_factory = sources_factory or (lambda day: _market_sources(pb, day))
+    st.jobs = JobManager(st.llm_lock, st.db_factory, job_runner or live_runner(settings, pb))
     # no /docs, /redoc or /openapi.json: the Swagger page pulls assets from a CDN
     # FastAPI's built-in OpenTelemetry instrumentation: every part off, and no exporter is ever added
     app = FastAPI(title="Options Income Copilot (local)", docs_url=None, redoc_url=None, openapi_url=None,
@@ -253,9 +257,12 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
 
     @app.post("/api/runs")
     def start_run(body: RunBody) -> dict:
-        ticker = body.ticker.upper()
-        if st.pb.tier_of(ticker) is None:
-            raise HTTPException(422, f"{ticker} is not in the playbook universe")
+        if body.kind == "monitor":
+            ticker = "ALL"   # one pass over every open paper position
+        else:
+            ticker = (body.ticker or "").upper()
+            if st.pb.tier_of(ticker) is None:
+                raise HTTPException(422, f"{ticker or 'a ticker'} is not in the playbook universe")
         try:
             job = st.jobs.start(body.kind, ticker, st.today())
         except RuntimeError as exc:
@@ -322,6 +329,58 @@ def create_app(settings: Settings, pb: Playbook, *, main_db: Database, eval_db: 
                 raise HTTPException(404, f"no run {run_id}")
             nodes = d.tot_nodes(run_id)
         return masked({"db": db, "run_id": run_id, "nodes": nodes})
+
+    # --- paper positions: live rule tracks (read-only) ---------------------------------------------
+
+    @app.get("/api/positions")
+    def positions() -> dict:
+        """Open paper positions with each management rule's progress, from a live snapshot
+        (monitor.snapshot + management.evaluate + management.rule_tracks). Cached briefly; a failed
+        refresh shows the last good row marked stale, or an error for that position."""
+        from ..broker import open_positions
+        from ..calculators import portfolio_heat_pct
+        from ..management import evaluate, heat_gauge, heat_review, rule_tracks
+        from ..monitor import _pending_for, snapshot
+        today = st.today()
+        db = st.db_factory()          # its own connection: live fetches must not hold the shared lock
+        try:
+            pos_list = open_positions(db)
+            heat = portfolio_heat_pct([p.entry_max_loss * p.contracts for p in pos_list],
+                                      st.settings.synthetic_portfolio_value)
+            sources, rows, now = None, [], time.monotonic()
+            for pos in pos_list:
+                base = {"position_id": pos.position_id, "ticker": pos.ticker, "strategy": pos.strategy.value,
+                        "opened_on": pos.opened_on.isoformat(), "expiry": pos.expiry.isoformat(),
+                        "contracts": pos.contracts, "entry_credit": pos.entry_credit,
+                        "entry_max_loss": pos.entry_max_loss,
+                        "legs": [{"side": g.side.value, "option_type": g.option_type.value, "strike": g.strike}
+                                 for g in pos.legs],
+                        "pending_brief": _pending_for(db, pos.position_id)}
+                hit = st.positions_cache.get(pos.position_id)
+                if hit and now - hit[0] < MARKET_TTL_SECONDS:
+                    rows.append({**hit[1], **base, "freshness": {"stale": False, "age_s": round(now - hit[0])}})
+                    continue
+                try:
+                    sources = sources or st.sources_factory(today)
+                    snap, info = snapshot(pos, sources, today, db, st.pb)
+                    ev = evaluate(pos, snap, st.pb)
+                    live = {"spot": snap.spot, "close_cost": info.get("close_cost"), "profit_pct": ev.profit_pct,
+                            "tracks": rule_tracks(pos, snap, ev, st.pb), "not_evaluated": list(ev.not_evaluated),
+                            "as_of": today.isoformat()}
+                    st.positions_cache[pos.position_id] = (now, live)
+                    rows.append({**live, **base, "freshness": {"stale": False, "age_s": 0}})
+                except Exception as exc:  # noqa: BLE001 - one position's data failure must not hide the others
+                    err = f"live data unavailable ({type(exc).__name__})"
+                    if hit:
+                        rows.append({**hit[1], **base, "freshness": {"stale": True, "age_s": round(now - hit[0]),
+                                                                    "error": err}})
+                    else:
+                        rows.append({**base, "tracks": [], "error": err})
+        finally:
+            db.close()
+        review = heat_review(heat, today, st.pb)
+        return out({"as_of": today.isoformat(), "positions": rows,
+                    "heat": {**heat_gauge(heat, st.pb), "review": review.reason if review else None}})
 
     # --- journal, metrics, evals ---------------------------------------------------------------
 
@@ -395,8 +454,15 @@ def trade_summary(kind: str, p: dict) -> dict:
 
 
 class RunBody(BaseModel):
-    ticker: str = Field(min_length=1, max_length=8, pattern=r"^[A-Za-z.]{1,8}$")
-    kind: str = Field(default="multi_agent", pattern="^(multi_agent|tot)$")
+    ticker: str | None = Field(default=None, min_length=1, max_length=8, pattern=r"^[A-Za-z.]{1,8}$")
+    kind: str = Field(default="multi_agent", pattern="^(multi_agent|tot|monitor)$")
+
+
+def _market_sources(pb: Playbook, day: date):
+    """Market data only (no EDGAR, no LLM, no Chroma): what the Positions snapshot needs."""
+    from ..market import Market
+    from ..tools import CachedSources, LiveSources
+    return CachedSources(LiveSources(pb, day, Market(), None, None, None))
 
 
 def _local_llm(settings: Settings):
